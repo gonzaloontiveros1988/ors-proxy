@@ -247,6 +247,46 @@ function momScoreOk(sym) {
 }
 
 const openPositions = {};
+
+// ── WATCHLIST DINÁMICA ────────────────────────────────────────────
+// Hasta 5 tickers extra añadidos manualmente o por el análisis sectorial
+// Duración: 3 días. Si no generan señal se eliminan automáticamente.
+// Se combinan con USER_WATCHLIST en cada ciclo de scan.
+const DYNAMIC_WL_MAX  = 5;
+const DYNAMIC_WL_DAYS = 3;
+let dynamicWL = []; // [{sym, addedAt, source, reason}]
+
+function getDynamicWL() {
+  const now = Date.now();
+  const cutoff = DYNAMIC_WL_DAYS * 24 * 60 * 60 * 1000;
+  // Limpiar caducados
+  dynamicWL = dynamicWL.filter(d => (now - d.addedAt) < cutoff);
+  return dynamicWL.map(d => d.sym);
+}
+
+function addToDynamicWL(sym, source, reason) {
+  sym = sym.toUpperCase().trim();
+  // No añadir si ya está en WL base
+  if (USER_WATCHLIST.includes(sym)) return { ok: false, msg: sym + ' ya está en WL base' };
+  // No duplicar
+  if (dynamicWL.find(d => d.sym === sym)) {
+    // Renovar tiempo
+    const idx = dynamicWL.findIndex(d => d.sym === sym);
+    dynamicWL[idx].addedAt = Date.now();
+    dynamicWL[idx].reason  = reason || dynamicWL[idx].reason;
+    return { ok: true, msg: sym + ' renovado en WL dinámica (3 días más)' };
+  }
+  // Límite 5
+  if (dynamicWL.length >= DYNAMIC_WL_MAX) {
+    // Quitar el más antiguo
+    dynamicWL.sort((a,b) => a.addedAt - b.addedAt);
+    const removed = dynamicWL.shift();
+    console.log('[DYN-WL] Límite alcanzado — eliminado:', removed.sym);
+  }
+  dynamicWL.push({ sym, addedAt: Date.now(), source: source||'manual', reason: reason||'' });
+  console.log('[DYN-WL] Añadido:', sym, '| Fuente:', source, '| WL actual:', getDynamicWL().join(','));
+  return { ok: true, msg: sym + ' añadido a WL dinámica (3 días)' };
+}
 const monthTradesDone = {}; // sym_YYYY-MM -> true (max 1 trade/ticker/mes)
 let scanMOMCache = null;    // caché del último scan MOM — BUG FIX: era local al endpoint // sym → {qty, entryPrice, stopPrice, target, stopOrderId, ts}
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
@@ -2484,7 +2524,13 @@ async function checkMOMSignals() {
   console.log(`[MOM] Modo ${regime.mode} | RSI ${rsiMin}-${rsiMax} | MinScore=${minScore} | Size=${spyMult}x | Tickers=${WATCHLIST.length}`);
   const now     = Date.now();
 
-  for (const sym of WATCHLIST) {
+  // Combinar WL base + WL dinámica
+  const effectiveWL = [...new Set([...WATCHLIST, ...getDynamicWL()])];
+  if (getDynamicWL().length > 0) {
+    console.log('[MOM] WL dinámica activa:', getDynamicWL().join(','));
+  }
+
+  for (const sym of effectiveWL) {
     try {
       let parsed = priceCache[sym];
       if (!parsed || now - parsed.ts > CACHE_TTL) {
@@ -3135,32 +3181,36 @@ async function updateSectorSentiment() {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) { console.log('[SECTOR] Sin ANTHROPIC_API_KEY'); return; }
 
-    // ── CAPA 1: Performance ETFs via Alpaca snapshots (sin Yahoo) ──────────────
+    // ── CAPA 1: Performance ETFs sectoriales (datos reales Alpaca) ──────────────
     const etfPerformance = {};
-    try {
-      const etfSyms = Object.values(SECTOR_ETFS).map(d => d.etf);
-      const snapUrl = `${ALPACA_DATA}/v2/stocks/snapshots?symbols=${etfSyms.join(',')}&feed=iex`;
-      const snapR   = await fetch(snapUrl, { headers: alpacaHeaders() });
-      const snapD   = await snapR.json();
-      for (const [sector, data] of Object.entries(SECTOR_ETFS)) {
-        const snap = snapD[data.etf];
-        if (snap && snap.dailyBar) {
-          const db = snap.dailyBar;
-          const prev = snap.prevDailyBar;
-          const perf1d = prev && prev.c ? +((db.c - prev.c) / prev.c * 100).toFixed(1) : 0;
-          const vol    = db.v || 0;
-          const avgVol = prev ? (prev.v || vol) : vol;
-          const rvol   = avgVol > 0 ? +(vol / avgVol).toFixed(2) : 1.0;
-          etfPerformance[sector] = {
-            etf:    data.etf,
-            perf1d: perf1d,
-            perf5d: 0,
-            perf1m: 0,
-            rvol:   rvol,
-          };
+    for (const [sector, data] of Object.entries(SECTOR_ETFS)) {
+      try {
+        const etfData = await fetchYahoo(data.etf, '1d', '1mo');
+        const prices  = etfData?.chart?.result?.[0];
+        if (prices?.indicators?.quote) {
+          const closes = prices.indicators.quote[0].close.filter(Boolean);
+          if (closes.length >= 20) {
+            const last   = closes[closes.length-1];
+            const perf1d = ((last - closes[closes.length-2]) / closes[closes.length-2] * 100).toFixed(1);
+            const perf5d = ((last - closes[closes.length-6]) / closes[closes.length-6] * 100).toFixed(1);
+            const perf1m = ((last - closes[0]) / closes[0] * 100).toFixed(1);
+            // Volumen relativo del ETF (institucional vs media 20 días)
+            const vols   = prices.indicators.quote[0].volume?.filter(Boolean) || [];
+            const avgVol = vols.slice(-20,-1).reduce((s,v)=>s+v,0)/19;
+            const lastVol= vols[vols.length-1] || 0;
+            const rvol   = avgVol > 0 ? (lastVol/avgVol).toFixed(2) : '1.0';
+            etfPerformance[sector] = {
+              etf: data.etf,
+              perf1d: parseFloat(perf1d),
+              perf5d: parseFloat(perf5d),
+              perf1m: parseFloat(perf1m),
+              rvol:   parseFloat(rvol),  // ← flujo institucional implícito
+            };
+          }
         }
-      }
-    } catch(e) { console.log('[SECTOR] ETF snapshots error:', e.message); }
+      } catch(e) { /* skip */ }
+      await new Promise(r => setTimeout(r, 200));
+    }
 
     // ── CAPA 2: Noticias Alpaca de ETFs y tickers principales ────────────────────
     const allNews = [];
@@ -3277,6 +3327,24 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
         console.log('[SECTOR] Análisis completado:');
         console.log('  BULLISH:', bullish.join(', ') || 'ninguno');
         console.log('  BEARISH:', bearish.join(', ') || 'ninguno');
+
+        // ── AUTO-AÑADIR a WL dinámica: top ticker de sectores BULLISH con score ≥75 ──
+        // Solo tickers que NO están ya en WL base y tienen score alto
+        for (const sectorKey of bullish) {
+          const sectorData = parsed[sectorKey];
+          if (!sectorData || sectorData.score < 75) continue;
+          const sectorTickers = (SECTOR_ETFS[sectorKey] || {}).tickers || [];
+          // Añadir solo el primer ticker del sector que no esté en WL base
+          const candidate = sectorTickers.find(t => !USER_WATCHLIST.includes(t));
+          if (candidate) {
+            const result = addToDynamicWL(
+              candidate,
+              'sector_ia',
+              `Sector ${sectorKey} BULLISH (score ${sectorData.score}) — análisis IA`
+            );
+            if (result.ok) console.log('[SECTOR→DYN-WL]', candidate, 'añadido por sector', sectorKey);
+          }
+        }
 
         // Detectar señales políticas importantes
         const politico_buys = Object.entries(parsed)
@@ -3567,6 +3635,48 @@ app.post('/weekly/run', async (req, res) => {
 // ── FORZAR ANÁLISIS SECTORIAL ────────────────────────────────────
 // POST /sector/run — ejecuta el análisis ahora sin esperar al cierre
 // Útil para ver tendencias políticas e institucionales en cualquier momento
+// ── WATCHLIST DINÁMICA — endpoints ───────────────────────────────
+
+// GET /watchlist/dynamic — ver WL dinámica actual
+app.get('/watchlist/dynamic', (req, res) => {
+  const now = Date.now();
+  const list = dynamicWL.map(d => ({
+    sym:       d.sym,
+    source:    d.source,
+    reason:    d.reason,
+    addedAt:   new Date(d.addedAt).toISOString(),
+    expiresIn: Math.round((DYNAMIC_WL_DAYS*24*60*60*1000 - (now-d.addedAt)) / (60*60*1000)) + 'h',
+  }));
+  res.json({
+    ok:      true,
+    base:    USER_WATCHLIST,
+    dynamic: list,
+    total:   USER_WATCHLIST.length + list.length,
+    max_dynamic: DYNAMIC_WL_MAX,
+  });
+});
+
+// POST /watchlist/dynamic — añadir ticker manualmente
+app.post('/watchlist/dynamic', async (req, res) => {
+  const { sym, reason } = req.body || {};
+  if (!sym) return res.json({ ok: false, msg: 'sym requerido' });
+  const result = addToDynamicWL(sym.toUpperCase(), 'manual', reason || 'Añadido manualmente');
+  // Notificar por Telegram
+  if (result.ok) {
+    await sendTelegram(`📋 WL dinámica actualizada\n➕ ${sym.toUpperCase()} añadido (3 días)\nFuente: Manual\n${reason ? 'Razón: '+reason : ''}`).catch(()=>{});
+  }
+  res.json(result);
+});
+
+// DELETE /watchlist/dynamic/:sym — quitar ticker manualmente
+app.delete('/watchlist/dynamic/:sym', (req, res) => {
+  const sym = req.params.sym.toUpperCase();
+  const before = dynamicWL.length;
+  dynamicWL = dynamicWL.filter(d => d.sym !== sym);
+  const removed = before > dynamicWL.length;
+  res.json({ ok: removed, msg: removed ? sym + ' eliminado de WL dinámica' : sym + ' no estaba en WL dinámica' });
+});
+
 app.post('/sector/run', async (req, res) => {
   const key = req.headers['x-api-key'] || req.query.key || '';
   // Protección mínima — solo desde la app
