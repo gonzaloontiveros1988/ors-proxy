@@ -3254,15 +3254,29 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1500,
+        max_tokens: 2000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       }),
     });
 
-    const claudeD = await claudeR.json();
+    const claudeD1 = await claudeR.json();
+    const searchText = (claudeD1.content||[]).filter(b=>b.type==='text').map(b=>b.text).join(' ');
 
-    // Extraer texto de la respuesta (puede haber tool_use + text blocks)
+    // PASO 2: formatear en JSON puro sin web_search
+    const claudeR2 = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1200,
+        system: 'Output only valid JSON. No text before or after. No markdown.',
+        messages: [{ role: 'user', content: 'Convert this analysis to JSON with keys AI_CHIPS,CLOUD,SPACE,CLEAN_ENERGY,BIOTECH,HEALTHCARE,AIRLINES,INDUSTRIAL,FINTECH. Each: {status:BULLISH/NEUTRAL/BEARISH,score:0-100,reason:string,politico:string,flujo_inst:string}. Analysis: ' + searchText }],
+      }),
+    });
+    const claudeD = await claudeR2.json();
+
+    // Extraer texto de la respuesta
     const textBlocks = (claudeD.content || [])
       .filter(b => b.type === 'text')
       .map(b => b.text)
@@ -3270,16 +3284,10 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
 
     if (textBlocks) {
       try {
-        // Limpiar markdown y extraer solo el JSON
-        const raw2 = textBlocks
-          .replace(/```json/g, '').replace(/```/g, '')
-          .replace(/[ --]/g, '') // chars de control
-          .trim();
-        const j1 = raw2.indexOf('{');
-        const j2 = raw2.lastIndexOf('}');
-        if (j1 === -1 || j2 === -1) throw new Error('No JSON encontrado');
-        const clean = raw2.slice(j1, j2 + 1);
-        const parsed  = JSON.parse(clean);
+        const raw2 = textBlocks.replace(/```json/g,'').replace(/```/g,'').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g,'').trim();
+        const j1 = raw2.indexOf('{'), j2 = raw2.lastIndexOf('}');
+        if(j1===-1||j2===-1) throw new Error('No JSON');
+        const parsed  = JSON.parse(raw2.slice(j1,j2+1));
         sectorSentiment   = parsed;
         sectorLastUpdate  = todayStr;
 
