@@ -3135,36 +3135,32 @@ async function updateSectorSentiment() {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) { console.log('[SECTOR] Sin ANTHROPIC_API_KEY'); return; }
 
-    // ── CAPA 1: Performance ETFs sectoriales (datos reales Alpaca) ──────────────
+    // ── CAPA 1: Performance ETFs via Alpaca snapshots (sin Yahoo) ──────────────
     const etfPerformance = {};
-    for (const [sector, data] of Object.entries(SECTOR_ETFS)) {
-      try {
-        const etfData = await fetchYahoo(data.etf, '1d', '1mo');
-        const prices  = etfData?.chart?.result?.[0];
-        if (prices?.indicators?.quote) {
-          const closes = prices.indicators.quote[0].close.filter(Boolean);
-          if (closes.length >= 20) {
-            const last   = closes[closes.length-1];
-            const perf1d = ((last - closes[closes.length-2]) / closes[closes.length-2] * 100).toFixed(1);
-            const perf5d = ((last - closes[closes.length-6]) / closes[closes.length-6] * 100).toFixed(1);
-            const perf1m = ((last - closes[0]) / closes[0] * 100).toFixed(1);
-            // Volumen relativo del ETF (institucional vs media 20 días)
-            const vols   = prices.indicators.quote[0].volume?.filter(Boolean) || [];
-            const avgVol = vols.slice(-20,-1).reduce((s,v)=>s+v,0)/19;
-            const lastVol= vols[vols.length-1] || 0;
-            const rvol   = avgVol > 0 ? (lastVol/avgVol).toFixed(2) : '1.0';
-            etfPerformance[sector] = {
-              etf: data.etf,
-              perf1d: parseFloat(perf1d),
-              perf5d: parseFloat(perf5d),
-              perf1m: parseFloat(perf1m),
-              rvol:   parseFloat(rvol),  // ← flujo institucional implícito
-            };
-          }
+    try {
+      const etfSyms = Object.values(SECTOR_ETFS).map(d => d.etf);
+      const snapUrl = `${ALPACA_DATA}/v2/stocks/snapshots?symbols=${etfSyms.join(',')}&feed=iex`;
+      const snapR   = await fetch(snapUrl, { headers: alpacaHeaders() });
+      const snapD   = await snapR.json();
+      for (const [sector, data] of Object.entries(SECTOR_ETFS)) {
+        const snap = snapD[data.etf];
+        if (snap && snap.dailyBar) {
+          const db = snap.dailyBar;
+          const prev = snap.prevDailyBar;
+          const perf1d = prev && prev.c ? +((db.c - prev.c) / prev.c * 100).toFixed(1) : 0;
+          const vol    = db.v || 0;
+          const avgVol = prev ? (prev.v || vol) : vol;
+          const rvol   = avgVol > 0 ? +(vol / avgVol).toFixed(2) : 1.0;
+          etfPerformance[sector] = {
+            etf:    data.etf,
+            perf1d: perf1d,
+            perf5d: 0,
+            perf1m: 0,
+            rvol:   rvol,
+          };
         }
-      } catch(e) { /* skip */ }
-      await new Promise(r => setTimeout(r, 200));
-    }
+      }
+    } catch(e) { console.log('[SECTOR] ETF snapshots error:', e.message); }
 
     // ── CAPA 2: Noticias Alpaca de ETFs y tickers principales ────────────────────
     const allNews = [];
