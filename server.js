@@ -3230,9 +3230,7 @@ Fuentes: etf.com, etfdb.com, ssga.com flows.
 CONCLUSIÓN: ¿Qué sectores tienen confluencia de momentum técnico + catalizador + dinero político/institucional?
 Estos son los sectores con mayor probabilidad de boom sostenido (como Space en 2024-2025).
 
-IMPORTANTE: Tu respuesta debe ser ÚNICAMENTE el objeto JSON, empezando con { y terminando con }.
-NO escribas nada antes ni después del JSON. NO uses markdown. NO expliques nada.
-
+Responde SOLO con este JSON (sin markdown):
 {
   "AI_CHIPS":     {"status":"BULLISH","score":75,"reason":"...max 2 frases...","politico":"...si hay dato...","flujo_inst":"..."},
   "CLOUD":        {"status":"NEUTRAL","score":50,"reason":"...","politico":"ninguno reciente","flujo_inst":"..."},
@@ -3247,23 +3245,34 @@ NO escribas nada antes ni después del JSON. NO uses markdown. NO expliques nada
 Status: BULLISH=momentum alcista confirmado, NEUTRAL=esperar, BEARISH=evitar.
 Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no entrar.`;
 
-    const claudeR = await fetch('https://api.anthropic.com/v1/messages', {
+    // PASO 1: buscar datos con web_search
+    const claudeR1 = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 2000,
-        system: 'Eres un analizador de sectores financieros. DEBES responder ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin markdown, sin explicaciones. Solo el JSON puro empezando con { y terminando con }.',
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       }),
     });
+    const d1 = await claudeR1.json();
+    const searchText = (d1.content||[]).filter(b=>b.type==='text').map(b=>b.text).join(' ');
 
-    const claudeD = await claudeR.json();
+    // PASO 2: formatear en JSON puro (sin web_search, solo texto)
+    const jsonInstructions = 'Convert this analysis to JSON. Return ONLY valid JSON object with keys: AI_CHIPS,CLOUD,SPACE,CLEAN_ENERGY,BIOTECH,HEALTHCARE,AIRLINES,INDUSTRIAL,FINTECH. Each key: {status:BULLISH/NEUTRAL/BEARISH, score:0-100, reason:string, politico:string, flujo_inst:string}. No text outside JSON. Analysis: ' + searchText;
+
+    const claudeR2 = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1000,
+        system: 'Responde SOLO con el objeto JSON. Sin texto adicional. Sin markdown.',
+        messages: [{ role: 'user', content: jsonInstructions }],
+      }),
+    });
+    const claudeD = await claudeR2.json();
 
     // Extraer texto de la respuesta (puede haber tool_use + text blocks)
     const textBlocks = (claudeD.content || [])
@@ -3273,8 +3282,11 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
 
     if (textBlocks) {
       try {
-        const clean   = textBlocks.replace(/```json|```/g, '').trim();
-        const parsed  = JSON.parse(clean);
+        const raw = textBlocks.replace(/```json|```/g, '');
+        const j1  = raw.indexOf('{');
+        const j2  = raw.lastIndexOf('}');
+        if (j1 === -1 || j2 === -1) throw new Error('No JSON: ' + raw.slice(0,50));
+        const parsed = JSON.parse(raw.slice(j1, j2+1));
         sectorSentiment   = parsed;
         sectorLastUpdate  = todayStr;
 
