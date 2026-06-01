@@ -3230,7 +3230,9 @@ Fuentes: etf.com, etfdb.com, ssga.com flows.
 CONCLUSIÓN: ¿Qué sectores tienen confluencia de momentum técnico + catalizador + dinero político/institucional?
 Estos son los sectores con mayor probabilidad de boom sostenido (como Space en 2024-2025).
 
-Responde SOLO con este JSON (sin markdown):
+IMPORTANTE: Tu respuesta debe ser ÚNICAMENTE el objeto JSON, empezando con { y terminando con }.
+NO escribas nada antes ni después del JSON. NO uses markdown. NO expliques nada.
+
 {
   "AI_CHIPS":     {"status":"BULLISH","score":75,"reason":"...max 2 frases...","politico":"...si hay dato...","flujo_inst":"..."},
   "CLOUD":        {"status":"NEUTRAL","score":50,"reason":"...","politico":"ninguno reciente","flujo_inst":"..."},
@@ -3254,7 +3256,8 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1500,
+        max_tokens: 2000,
+        system: 'Eres un analizador de sectores financieros. DEBES responder ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin markdown, sin explicaciones. Solo el JSON puro empezando con { y terminando con }.',
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -3270,12 +3273,7 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
 
     if (textBlocks) {
       try {
-        // Extraer solo el JSON — Claude a veces añade texto antes del JSON
-        const raw = textBlocks.replace(/```json|```/g, '');
-        const jsonStart = raw.indexOf('{');
-        const jsonEnd   = raw.lastIndexOf('}');
-        if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON en respuesta');
-        const clean   = raw.slice(jsonStart, jsonEnd + 1);
+        const clean   = textBlocks.replace(/```json|```/g, '').trim();
         const parsed  = JSON.parse(clean);
         sectorSentiment   = parsed;
         sectorLastUpdate  = todayStr;
