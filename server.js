@@ -3254,7 +3254,7 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1500,
+        max_tokens: 2000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -3263,23 +3263,20 @@ Score 0-100: confianza en el momentum. >70 = entrar, 40-70 = cautela, <40 = no e
     const d1 = await claudeR.json();
     const searchText = (d1.content||[]).filter(b=>b.type==='text').map(b=>b.text).join(' ').slice(0,3000);
 
-    // PASO 2: formatear JSON sin web_search
+    // PASO 2: Opus formatea en JSON puro — sin tools, instrucciones directas
     const claudeR2 = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-opus-4-5',
         max_tokens: 2000,
         system: 'Output ONLY valid JSON. No markdown. No extra text. All string values max 80 chars.',
-        messages: [{role:'user', content:'Return JSON only. 9 keys: AI_CHIPS,CLOUD,SPACE,CLEAN_ENERGY,BIOTECH,HEALTHCARE,AIRLINES,INDUSTRIAL,FINTECH. Each value: {status:BULLISH/NEUTRAL/BEARISH,score:number,reason:string,politico:string,flujo_inst:string}. Based on: ' + searchText}],
+        messages: [{role:'user', content:'Return JSON only. 9 keys: AI_CHIPS,CLOUD,SPACE,CLEAN_ENERGY,BIOTECH,HEALTHCARE,AIRLINES,INDUSTRIAL,FINTECH. Each: {status:BULLISH/NEUTRAL/BEARISH,score:number,reason:string,politico:string,flujo_inst:string}. Based on: ' + searchText}],
       }),
     });
     const claudeD = await claudeR2.json();
 
-    const textBlocks = (claudeD.content || [])
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
+    const textBlocks = (claudeD.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
 
     if (textBlocks) {
       try {
