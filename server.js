@@ -284,6 +284,31 @@ function adjustedATR(atr, price) {
   return (atr / price) < minAtrPct ? price * minAtrPct : atr;
 }
 
+// ── MAC FILTER (Bernstein) ────────────────────────────────────────
+function calcMAC(prices) {
+  if (!prices || prices.length < 10) return null;
+  const MAH = prices.slice(-10).reduce((s,c) => s+(c.high||c.close),0)/10;
+  const MAL = prices.slice(-8).reduce((s,c)  => s+(c.low||c.close),0)/8;
+  return { MAH, MAL, width: MAH-MAL };
+}
+function macFilter(prices, close, atr) {
+  const mac = calcMAC(prices);
+  if (!mac) return { pass: true, reason: 'MAC:insuf' };
+  if (mac.width < atr*0.25) return { pass: false, reason: 'MAC:comprimido' };
+  return close > mac.MAH
+    ? { pass: true,  reason: `MAC:OK(>${mac.MAH.toFixed(2)})` }
+    : { pass: false, reason: `MAC:dentro_canal(MAH:${mac.MAH.toFixed(2)})` };
+}
+
+// ── 8OC FILTER (Bernstein Eight-Bar Open/Close) ───────────────────
+function eightBarFilter(prices, atr) {
+  if (!prices || prices.length < 8) return { pass: true, reason: '8OC:insuf' };
+  const score = prices.slice(-8).reduce((s,c) => s+((c.close||c.c)-(c.open||c.o||c.close)),0);
+  return score > -(atr*0.1)
+    ? { pass: true,  reason: `8OC:OK(${score.toFixed(3)})` }
+    : { pass: false, reason: `8OC:negativo(${score.toFixed(3)})` };
+}
+
 async function executeAlpacaOrder(sym, order) {
   // ── GUARDIA FINAL: nunca ejecutar si el mercado está cerrado ─────────────────
   if (!isMarketOpen()) {
@@ -329,11 +354,16 @@ async function executeAlpacaOrder(sym, order) {
     const stopOrder = await stopResp.json();
 
     // 3. Track position con exit rules completas
+    // PT1/PT2 exit escalonado (Bernstein)
+    const _atrForPT = order.atr || (order.price - order.stopPrice) / 1.5;
     openPositions[sym] = {
       sym, qty1, qty2, qty: qty1 + qty2,
       entryPrice: order.price, stopPrice: order.stopPrice,
       originalStop: order.stopPrice,
       target1: order.target1, rr: order.rr,
+      pt1Price:  parseFloat((order.price + _atrForPT * 1.5).toFixed(2)),
+      pt2Price:  parseFloat((order.price + _atrForPT * 3.0).toFixed(2)),
+      pt1Hit: false, pt2Hit: false,
       stopOrderId: stopOrder.id,
       buyOrderId: buyOrder.id,
       phase2Done: false, ts: Date.now(),
@@ -671,6 +701,35 @@ async function manageTrailingStops() {
       // ══════════════════════════════════════════════════════
       // NIVEL 1 — Stop loss fijo (igual para ORS y MOM)
       // ══════════════════════════════════════════════════════
+
+      // ── PT1/PT2 SCALED EXIT (Bernstein) ──────────────────────────
+      if (pos.pt1Price && !pos.pt1Hit && price >= pos.pt1Price) {
+        pos.pt1Hit = true;
+        const qtyPT1 = pos.qty1;
+        try {
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol: sym, qty: String(qtyPT1), side:'sell', type:'market', time_in_force:'day' }) });
+          const beStop = parseFloat((pos.entryPrice*1.002).toFixed(2));
+          pos.stopPrice     = beStop;
+          pos.breakevenDone = true;
+          openPositions[sym] = pos;
+          const pnl = Math.round((price-pos.entryPrice)*qtyPT1/1.08);
+          await sendTelegram(`🎯 <b>PT1 ALCANZADO — ${sym}</b>\nCerrado ${qtyPT1} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🛡 Stop → Breakeven $${beStop}\n⏳ PT2: $${pos.pt2Price}`);
+        } catch(e) { console.error('[PT1 ERROR]', sym, e.message); }
+      }
+      if (pos.pt2Price && pos.pt1Hit && !pos.pt2Hit && price >= pos.pt2Price) {
+        pos.pt2Hit = true;
+        const qtyPT2 = pos.qty2;
+        try {
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol: sym, qty: String(qtyPT2), side:'sell', type:'market', time_in_force:'day' }) });
+          const pnl = Math.round((price-pos.entryPrice)*qtyPT2/1.08);
+          await sendTelegram(`✅ <b>PT2 ALCANZADO — ${sym}</b>\nCerrado ${qtyPT2} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🏁 Posición COMPLETA`);
+          delete openPositions[sym];
+          continue;
+        } catch(e) { console.error('[PT2 ERROR]', sym, e.message); }
+      }
+
       if(pos.stopPrice && price <= pos.stopPrice * 0.999){
         const sold = await executeSell(sym, totalQty,
           `${isMOM?'MOM':'ORS'} Stop loss $${pos.stopPrice}`, price);
@@ -3754,7 +3813,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.47.9',
+    version:       '3.48.0',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -5494,6 +5553,52 @@ app.get('/trades/stats', (req, res) => {
     byExitReason: byReason,
     best:   sorted[0]  || null,
     worst:  sorted[sorted.length-1] || null,
+  });
+});
+
+// ── TRADES STATS POR ESTRATEGIA ──────────────────────────────────
+app.get('/trades/stats/strategy', (req, res) => {
+  function stratStats(trades) {
+    const wins   = trades.filter(t => t.win);
+    const losses = trades.filter(t => !t.win);
+    const grossW = wins.reduce((s,t)   => s+(t.pnlEur||0), 0);
+    const grossL = Math.abs(losses.reduce((s,t) => s+(t.pnlEur||0), 0));
+    const wr     = trades.length ? (wins.length/trades.length*100).toFixed(1) : 0;
+    const pf     = grossL > 0 ? (grossW/grossL).toFixed(2) : null;
+    const byReason = {};
+    trades.forEach(t => {
+      const r = t.exitReason||'Unknown';
+      if(!byReason[r]) byReason[r]={count:0,wins:0,pnl:0};
+      byReason[r].count++; byReason[r].pnl+=t.pnlEur||0;
+      if(t.win) byReason[r].wins++;
+    });
+    // Max drawdown
+    let cap=0, peak=0, maxDD=0;
+    trades.forEach(t => {
+      cap+=t.pnlEur||0;
+      if(cap>peak) peak=cap;
+      const dd=peak>0?(peak-cap)/peak*100:0;
+      if(dd>maxDD) maxDD=dd;
+    });
+    return {
+      trades: trades.length, wins: wins.length, losses: losses.length,
+      winRate: parseFloat(wr), profitFactor: pf ? parseFloat(pf) : null,
+      totalPnlEur: Math.round(grossW-grossL),
+      avgWinEur: wins.length ? Math.round(grossW/wins.length) : 0,
+      avgLossEur: losses.length ? -Math.round(grossL/losses.length) : 0,
+      maxDrawdownPct: parseFloat(maxDD.toFixed(1)),
+      byExitReason: byReason,
+    };
+  }
+  const momTrades   = tradeHistory.filter(t => t.system==='MOM');
+  const orsTrades   = tradeHistory.filter(t => t.system==='ORS');
+  const swingTrades = tradeHistory.filter(t => t.system==='SWING');
+  res.json({
+    timestamp: new Date().toISOString(),
+    MOM:   stratStats(momTrades),
+    ORS:   stratStats(orsTrades),
+    SWING: stratStats(swingTrades),
+    TOTAL: stratStats(tradeHistory),
   });
 });
 
