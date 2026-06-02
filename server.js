@@ -955,6 +955,23 @@ const SECTOR_MAP = {
   SPACE:       ['TSLA','RKLB','LUNR'],
 };
 
+// ── MAPEO SECTOR_MAP → claves sectorSentiment (Claude) ──
+// sectorSentiment usa claves de SECTOR_ETFS: AI_CHIPS,CLOUD,SPACE,CLEAN_ENERGY,BIOTECH,HEALTHCARE,AIRLINES,INDUSTRIAL,FINTECH
+const SECTOR_MAP_TO_SENTIMENT = {
+  AI_CHIPS:   'AI_CHIPS',
+  CLOUD:      'CLOUD',
+  AI_INFRA:   'CLOUD',
+  NUCLEAR:    'CLEAN_ENERGY',
+  ENERGIA:    'INDUSTRIAL',
+  DEFENSA:    'INDUSTRIAL',
+  INDUSTRIAL: 'INDUSTRIAL',
+  AIRLINES:   'AIRLINES',
+  HEALTHCARE: 'HEALTHCARE',
+  BIOTECH:    'BIOTECH',
+  FINTECH:    'FINTECH',
+  SPACE:      'SPACE',
+};
+
 // ── SECTOR ETF FILTER — no entrar si el ETF del sector es bajista ──
 const SECTOR_ETF = {
   AI_CHIPS:   'XLK',
@@ -2661,6 +2678,18 @@ async function checkMOMSignals() {
 
       if (!canReEnter(sym, sig.last)) continue;
 
+      // ── FILTRO SECTORIAL — solo entrar si el sector está BULLISH o NEUTRAL ──
+      // sectorSentiment se actualiza cada mañana con Claude + ETF prices
+      // Si el sector es BEARISH (score < 40) → skip
+      const _symSector    = getSector(sym);
+      const _sentKey      = SECTOR_MAP_TO_SENTIMENT[_symSector];
+      const _sent         = _sentKey && sectorSentiment[_sentKey];
+      if (_sent && _sent.status === 'BEARISH' && (_sent.score || 50) < 40) {
+        console.log(`[SECTOR FILTER] ${sym} bloqueado — ${_symSector}(${_sentKey}) BEARISH score:${_sent.score}`);
+        continue;
+      }
+      const _sectorTag = _sent ? `${_sent.status}(${_sent.score})` : 'NO_DATA';
+
       // Position sizing MOM corregido
       const _atr        = sig.atr || sig.last * 0.015;
       const _stop       = parseFloat((sig.last - _atr * 1.5).toFixed(2)); // ATR×1.5
@@ -2689,7 +2718,7 @@ async function checkMOMSignals() {
           `📦 ${_qty} acc | Riesgo €${Math.round(_riskPerSh*_qty/1.08)}\n` +
           `📊 RSI ${sig.rsi?.toFixed(1)} | OBV ✅ | RVOL ${sig.rvol}x\n` +
           `📈 Breakout ✅ | SPY ${spyContext.trend}\n` +
-          `🏭 Sector: ${getSector(sym)} | R:R 1.5:1`
+          `🏭 Sector: ${getSector(sym)} ${_sectorTag} | R:R 1.5:1`
         );
       } else {
         await sendTelegram(
@@ -2698,7 +2727,7 @@ async function checkMOMSignals() {
           `📦 ${_qty} acc | Riesgo: €${Math.round(_riskPerSh*_qty/1.08)}\n` +
           `📊 RSI ${sig.rsi?.toFixed(1)} | OBV ✅ | RVOL ${sig.rvol}x\n` +
           `📈 Breakout: ${sig.breakout?'✅':'❌'} | SPY: ${spyContext.trend}\n` +
-          `🏭 Sector: ${getSector(sym)} | R:R 1.5:1\n\n` +
+          `🏭 Sector: ${getSector(sym)} ${_sectorTag} | R:R 1.5:1\n\n` +
           `✅ /ejecutar_${sym}   ❌ /cancelar_${sym}`
         );
       }
@@ -3123,6 +3152,66 @@ const SECTOR_ETFS = {
 // Estado global del análisis sectorial — se actualiza cada mañana
 let sectorSentiment = {}; // sector -> {status:'BULLISH'|'NEUTRAL'|'BEARISH', score:0-100, reason:''}
 let sectorLastUpdate = null;
+
+// ── ACTUALIZACIÓN LIGERA DIARIA (sin Claude) — solo precios ETF ──
+// Corre cada mañana a las 13:00 UTC (antes del mercado). Sin coste API.
+// Si sectorSentiment está vacío inicializa con NEUTRAL.
+async function updateSectorETFLight() {
+  const ETF_MAP = {
+    AI_CHIPS:     'SOXX',
+    CLOUD:        'CLOU',
+    SPACE:        'XAR',
+    CLEAN_ENERGY: 'ICLN',
+    BIOTECH:      'XBI',
+    FINTECH:      'FINX',
+    HEALTHCARE:   'XLV',
+    AIRLINES:     'JETS',
+    INDUSTRIAL:   'XLI',
+  };
+  console.log('[SECTOR LIGHT] Actualizando sentimiento sectorial por ETF...');
+  let updated = 0;
+  for (const [sector, etf] of Object.entries(ETF_MAP)) {
+    try {
+      const data   = await fetchYahoo(etf, '1d', '1mo');
+      const prices = data?.chart?.result?.[0];
+      if (!prices?.indicators?.quote) continue;
+      const closes = prices.indicators.quote[0].close.filter(Boolean);
+      if (closes.length < 10) continue;
+      const last   = closes[closes.length - 1];
+      const sma10  = closes.slice(-10).reduce((s,v) => s+v, 0) / 10;
+      const sma20  = closes.length >= 20 ? closes.slice(-20).reduce((s,v) => s+v, 0) / 20 : sma10;
+      const perf5d = ((last - closes[closes.length - 6]) / closes[closes.length - 6] * 100);
+      const perf1m = ((last - closes[0]) / closes[0] * 100);
+      let score = 50;
+      if (last > sma10)  score += 10;
+      if (last > sma20)  score += 10;
+      if (perf5d > 1)    score += 10;
+      if (perf5d > 3)    score += 5;
+      if (perf5d < -2)   score -= 15;
+      if (perf1m > 5)    score += 10;
+      if (perf1m < -5)   score -= 15;
+      score = Math.max(0, Math.min(100, score));
+      const status = score >= 60 ? 'BULLISH' : score <= 35 ? 'BEARISH' : 'NEUTRAL';
+      const existing = sectorSentiment[sector] || {};
+      sectorSentiment[sector] = {
+        ...existing, status, score, etf,
+        perf5d: parseFloat(perf5d.toFixed(2)),
+        perf1m: parseFloat(perf1m.toFixed(2)),
+        lightUpdate: new Date().toISOString().slice(0,10),
+      };
+      updated++;
+    } catch(e) { console.log(`[SECTOR LIGHT] ${etf} error:`, e.message); }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  console.log(`[SECTOR LIGHT] Completado — ${updated} sectores`);
+  const bullish = Object.entries(sectorSentiment).filter(([,v]) => v.status==='BULLISH').map(([k]) => k);
+  const bearish = Object.entries(sectorSentiment).filter(([,v]) => v.status==='BEARISH').map(([k]) => k);
+  await sendTelegram(
+    `📊 <b>Sector Update Diario</b>\n` +
+    `🟢 BULLISH: ${bullish.join(', ') || 'ninguno'}\n` +
+    `🔴 BEARISH: ${bearish.join(', ') || 'ninguno'}`
+  ).catch(() => {});
+}
 
 async function updateSectorSentiment() {
   const now = new Date();
@@ -5492,6 +5581,25 @@ app.listen(PORT, async () => {
     }, msUntilClose);
   }
   scheduleRegimeUpdate();
+
+  // ── SECTOR ETF LIGHT — actualización diaria a las 13:00 UTC (pre-mercado) ──
+  function scheduleSectorLightUpdate() {
+    const now = new Date();
+    const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 13, 0, 0));
+    if (now >= target) target.setUTCDate(target.getUTCDate() + 1);
+    while (target.getUTCDay() === 0 || target.getUTCDay() === 6) {
+      target.setUTCDate(target.getUTCDate() + 1);
+    }
+    const ms = target.getTime() - now.getTime();
+    console.log(`[SECTOR LIGHT] Próxima actualización ETF: ${target.toUTCString()} (en ${Math.round(ms/60000)} min)`);
+    setTimeout(async () => {
+      await updateSectorETFLight().catch(e => console.log('[SECTOR LIGHT] Error:', e.message));
+      scheduleSectorLightUpdate();
+    }, ms);
+  }
+  scheduleSectorLightUpdate();
+  // Ejecutar también al arranque para tener datos desde el primer minuto
+  updateSectorETFLight().catch(e => console.log('[SECTOR LIGHT] Startup error:', e.message));
 
   // VIX cada 30 min (sí cambia rápido — afecta sizing inmediato)
   setInterval(updateVIXContext, 30 * 60 * 1000);
