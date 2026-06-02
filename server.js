@@ -90,7 +90,50 @@ const USER_WATCHLIST = (process.env.WATCHLIST || [
 ].join(',')).split(',');
 
 // El scan usa SP500_FULL; la watchlist personal para el home y trades
-const WATCHLIST = USER_WATCHLIST; // WL41 — para señales en tiempo real (era SP500_FULL que tarda 2+ min)
+// WATCHLIST dinámica — se actualiza cada domingo con el scanner semanal
+// Añade hasta 10 tickers del SP500 con mejor momentum
+let DYNAMIC_WL_ADDITIONS = []; // rellenado por el scanner semanal
+let DYNAMIC_WL_REMOVALS  = []; // tickers temporalmente pausados
+
+// ── SISTEMA DE TRES ESTADOS ──────────────────────────────────────
+// ACTIVE:    scanner 5min + señales automáticas (por defecto)
+// WATCH:     solo scanner semanal — sin señales auto
+//            si momentum score >70 dos semanas → Telegram propone reactivar
+// DISCARDED: fuera definitivamente
+const TICKER_STATUS = {
+  // WATCH — vigilar sin operar (pueden recuperarse)
+  'AMD':   'WATCH',   // 0 runners históricos — puede volver en ciclo AI
+  'VST':   'WATCH',   // 0 runners — energy vol, revisar octubre
+  'META':  'WATCH',   // 0 runners — puede volver con ciclo publicidad
+  'SWKS':  'WATCH',   // 0 runners — semiconductores semi, vigilar
+  // DISCARDED — fuera definitivamente
+  'LUV':   'DISCARDED', // no disponible en Alpaca paper
+  'ZIM':   'DISCARDED', // shipping macro puro, no MOM
+  'SW':    'DISCARDED', // sin datos suficientes
+};
+
+const WATCH_TICKERS = Object.keys(TICKER_STATUS).filter(t => TICKER_STATUS[t] === 'WATCH');
+
+// ¿Puede este ticker generar señales automáticas?
+function isActive(sym) {
+  const s = TICKER_STATUS[sym];
+  return !s || s === 'ACTIVE';
+}
+
+// ¿Incluir en análisis semanal SP500?
+function includeInWeeklyScan(sym) {
+  const s = TICKER_STATUS[sym];
+  return !s || s === 'ACTIVE' || s === 'WATCH';
+}
+
+// Función para obtener la watchlist activa en tiempo real
+function getActiveWatchlist() {
+  return USER_WATCHLIST
+    .concat(DYNAMIC_WL_ADDITIONS)
+    .filter(s => DYNAMIC_WL_REMOVALS.indexOf(s) < 0)
+    .filter(s => isActive(s))            // solo ACTIVE
+    .filter((s, i, arr) => arr.indexOf(s) === i); // deduplicar
+}
 const IBKR_ACCOUNT  = process.env.IBKR_ACCOUNT  || 'U24668151';
 const IBKR_PAPER    = process.env.IBKR_PAPER    || 'DU24668151';
 const IBKR_BASE     = process.env.IBKR_BASE     || 'https://api.ibkr.com/v1/api';
@@ -284,6 +327,31 @@ function adjustedATR(atr, price) {
   return (atr / price) < minAtrPct ? price * minAtrPct : atr;
 }
 
+// ── MAC FILTER (Bernstein) ────────────────────────────────────────
+function calcMAC(prices) {
+  if (!prices || prices.length < 10) return null;
+  const MAH = prices.slice(-10).reduce((s,c) => s+(c.high||c.close),0)/10;
+  const MAL = prices.slice(-8).reduce((s,c)  => s+(c.low||c.close),0)/8;
+  return { MAH, MAL, width: MAH-MAL };
+}
+function macFilter(prices, close, atr) {
+  const mac = calcMAC(prices);
+  if (!mac) return { pass: true, reason: 'MAC:insuf' };
+  if (mac.width < atr*0.25) return { pass: false, reason: 'MAC:comprimido' };
+  return close > mac.MAH
+    ? { pass: true,  reason: `MAC:OK(>${mac.MAH.toFixed(2)})` }
+    : { pass: false, reason: `MAC:dentro_canal(MAH:${mac.MAH.toFixed(2)})` };
+}
+
+// ── 8OC FILTER (Bernstein Eight-Bar Open/Close) ───────────────────
+function eightBarFilter(prices, atr) {
+  if (!prices || prices.length < 8) return { pass: true, reason: '8OC:insuf' };
+  const score = prices.slice(-8).reduce((s,c) => s+((c.close||c.c)-(c.open||c.o||c.close)),0);
+  return score > -(atr*0.1)
+    ? { pass: true,  reason: `8OC:OK(${score.toFixed(3)})` }
+    : { pass: false, reason: `8OC:negativo(${score.toFixed(3)})` };
+}
+
 async function executeAlpacaOrder(sym, order) {
   // ── GUARDIA FINAL: nunca ejecutar si el mercado está cerrado ─────────────────
   if (!isMarketOpen()) {
@@ -292,9 +360,14 @@ async function executeAlpacaOrder(sym, order) {
     return null;
   }
 
+  // ── VERIFICAR ESTADO TICKER ──────────────────────────────────────────────────
+  if (!isActive(sym)) {
+    console.log(`[BLOCKED] ${sym}: estado ${TICKER_STATUS[sym]} — no operar`);
+    delete pendingOrders[sym];
+    return null;
+  }
+
   // ── VERIFICAR ASSET TRADABLE EN ALPACA ───────────────────────────────────────
-  // Antes de intentar la orden, verificar que el ticker existe y es operable
-  // Evita el error "respuesta no-JSON" cuando el ticker no está disponible en paper
   try {
     const assetResp = await fetch(`${alpacaBase()}/v2/assets/${sym}`, { headers: alpacaHeaders() });
     const assetText = await assetResp.text();
@@ -303,15 +376,13 @@ async function executeAlpacaOrder(sym, order) {
     if (!asset || asset.tradable === false || asset.status !== 'active') {
       const reason = !asset ? 'respuesta inválida' : (!asset.tradable ? 'not tradable' : `status: ${asset.status}`);
       console.log(`[BLOCKED] ${sym}: asset no operable en Alpaca — ${reason}`);
-      await sendTelegram(`⚠️ <b>Señal bloqueada — ${sym}</b>\nEl ticker no está disponible en Alpaca paper trading (${reason}).\nEliminarlo de la watchlist.`);
-      // Eliminar de pendingOrders para no reintentar
+      await sendTelegram(`⚠️ <b>Señal bloqueada — ${sym}</b>\nNo disponible en Alpaca paper (${reason}). Eliminar de watchlist.`);
       delete pendingOrders[sym];
       return null;
     }
-    console.log(`[ASSET OK] ${sym}: tradable=${asset.tradable} status=${asset.status} exchange=${asset.exchange}`);
+    console.log(`[ASSET OK] ${sym}: tradable=${asset.tradable} status=${asset.status}`);
   } catch(assetErr) {
-    console.log(`[ASSET CHECK ERROR] ${sym}: ${assetErr.message} — continuando de todas formas`);
-    // Si falla el check por timeout/red, intentar la orden igualmente
+    console.log(`[ASSET CHECK ERROR] ${sym}: ${assetErr.message} — continuando`);
   }
 
   const acc = getAcc();
@@ -352,11 +423,15 @@ async function executeAlpacaOrder(sym, order) {
     const stopOrder = await stopResp.json();
 
     // 3. Track position con exit rules completas
+    const _atrPT = order.atr || (order.price - order.stopPrice) / 1.5;
     openPositions[sym] = {
       sym, qty1, qty2, qty: qty1 + qty2,
       entryPrice: order.price, stopPrice: order.stopPrice,
       originalStop: order.stopPrice,
       target1: order.target1, rr: order.rr,
+      pt1Price: parseFloat((order.price + _atrPT * 1.5).toFixed(2)),
+      pt2Price: parseFloat((order.price + _atrPT * 3.0).toFixed(2)),
+      pt1Hit: false, pt2Hit: false,
       stopOrderId: stopOrder.id,
       buyOrderId: buyOrder.id,
       phase2Done: false, ts: Date.now(),
@@ -694,6 +769,31 @@ async function manageTrailingStops() {
       // ══════════════════════════════════════════════════════
       // NIVEL 1 — Stop loss fijo (igual para ORS y MOM)
       // ══════════════════════════════════════════════════════
+
+      // ── PT1/PT2 SCALED EXIT ───────────────────────────────────
+      if (pos.pt1Price && !pos.pt1Hit && price >= pos.pt1Price) {
+        pos.pt1Hit = true;
+        try {
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol: sym, qty: String(pos.qty1), side:'sell', type:'market', time_in_force:'day' }) });
+          pos.stopPrice = parseFloat((pos.entryPrice*1.002).toFixed(2));
+          pos.breakevenDone = true;
+          openPositions[sym] = pos;
+          const pnl = Math.round((price-pos.entryPrice)*pos.qty1/1.08);
+          await sendTelegram(`🎯 <b>PT1 ALCANZADO — ${sym}</b>\nCerrado ${pos.qty1} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🛡 Stop → Breakeven $${pos.stopPrice}\n⏳ PT2: $${pos.pt2Price}`);
+        } catch(e) { console.error('[PT1]', sym, e.message); }
+      }
+      if (pos.pt2Price && pos.pt1Hit && !pos.pt2Hit && price >= pos.pt2Price) {
+        pos.pt2Hit = true;
+        try {
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol: sym, qty: String(pos.qty2), side:'sell', type:'market', time_in_force:'day' }) });
+          const pnl = Math.round((price-pos.entryPrice)*pos.qty2/1.08);
+          await sendTelegram(`✅ <b>PT2 ALCANZADO — ${sym}</b>\nCerrado ${pos.qty2} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🏁 Posición COMPLETA`);
+          delete openPositions[sym]; continue;
+        } catch(e) { console.error('[PT2]', sym, e.message); }
+      }
+
       if(pos.stopPrice && price <= pos.stopPrice * 0.999){
         const sold = await executeSell(sym, totalQty,
           `${isMOM?'MOM':'ORS'} Stop loss $${pos.stopPrice}`, price);
@@ -2188,6 +2288,27 @@ async function pollTelegramCommands() {
       }
 
       // /ayuda → help
+      else if (text.startsWith('/reactivar ')) {
+        const sym = text.split(' ')[1]?.toUpperCase();
+        if (sym && TICKER_STATUS[sym] === 'WATCH') {
+          delete TICKER_STATUS[sym];
+          await sendTelegram(`✅ <b>${sym} reactivado → ACTIVE</b>\nEl scanner generará señales normalmente.`);
+        } else if (sym) {
+          await sendTelegram(`ℹ️ ${sym} ya está ACTIVE o no se puede reactivar (${TICKER_STATUS[sym]||'ACTIVE'})`);
+        }
+      }
+      else if (text.startsWith('/pausar ')) {
+        const sym = text.split(' ')[1]?.toUpperCase();
+        if (sym) {
+          TICKER_STATUS[sym] = 'WATCH';
+          await sendTelegram(`👁 <b>${sym} → WATCH</b>\nSin señales auto. El scanner semanal lo monitoriza.`);
+        }
+      }
+      else if (text === '/estados') {
+        const watch = Object.entries(TICKER_STATUS).filter(([,v])=>v==='WATCH').map(([k])=>k);
+        const disc  = Object.entries(TICKER_STATUS).filter(([,v])=>v==='DISCARDED').map(([k])=>k);
+        await sendTelegram(`📊 <b>Estados tickers</b>\n👁 WATCH: ${watch.join(', ')||'ninguno'}\n❌ DISCARDED: ${disc.join(', ')||'ninguno'}\n\nUsa /reactivar TICKER o /pausar TICKER`);
+      }
       else if (text === '/ayuda' || text === '/help' || text === '/start') {
         await sendTelegram(
           '🤖 <b>ORS Analyzer Bot v3</b>\n' +
@@ -2524,7 +2645,7 @@ async function checkMOMSignals() {
   console.log(`[MOM] Modo ${regime.mode} | RSI ${rsiMin}-${rsiMax} | MinScore=${minScore} | Size=${spyMult}x | Tickers=${WATCHLIST.length}`);
   const now     = Date.now();
 
-  for (const sym of WATCHLIST) {
+  for (const sym of getActiveWatchlist()) {
     try {
       let parsed = priceCache[sym];
       if (!parsed || now - parsed.ts > CACHE_TTL) {
@@ -2802,7 +2923,7 @@ async function checkSignals() {
   const now = Date.now();
   const candidateSignals = []; // Acumula señales para rankear
 
-  for (const sym of WATCHLIST) {
+  for (const sym of getActiveWatchlist()) {
     try {
       // ── CARGAR DATOS ────────────────────────────────
       let parsed = priceCache[sym];
@@ -3025,7 +3146,7 @@ async function checkSignals() {
   }
 
   // ── SEÑALES DE SALIDA por agotamiento ─────────────
-  for (const sym of WATCHLIST) {
+  for (const sym of getActiveWatchlist()) {
     try {
       let parsed = priceCache[sym];
       if (!parsed?.prices?.length) continue;
@@ -3602,6 +3723,26 @@ Responde en formato JSON:
     await sendTelegram(msg).catch(() => {});
     console.log('[WEEKLY] Completado. Añadidos:', DYNAMIC_WL_ADDITIONS, '| Pausados:', DYNAMIC_WL_REMOVALS);
 
+    // ── Evaluar tickers WATCH — proponer reactivación si momentum fuerte ──
+    const watchResults = [];
+    for (const sym of WATCH_TICKERS) {
+      const symData = topCandidates.find(([s]) => s === sym);
+      if (symData && symData[1] > 65) { // score > 65
+        watchResults.push({ sym, score: symData[1].toFixed(1) });
+      }
+    }
+    if (watchResults.length) {
+      const watchMsg = watchResults.map(w => `${w.sym}(score:${w.score})`).join(', ');
+      await sendTelegram(
+        `👁 <b>WATCH — Tickers recuperándose</b>\n` +
+        `${watchMsg}\n\n` +
+        `Estos tickers están en WATCH (sin señales auto).\n` +
+        `Si mantienen momentum 2 semanas → considera reactivar.\n` +
+        `Usa /reactivar TICKER para moverlos a ACTIVE.`
+      );
+      console.log('[WEEKLY] WATCH con momentum:', watchResults);
+    }
+
   } catch (e) {
     console.log('[WEEKLY] Error:', e.message);
   }
@@ -3679,7 +3820,7 @@ app.get('/weekly/analysis', (req, res) => {
     additions:  DYNAMIC_WL_ADDITIONS,
     removals:   DYNAMIC_WL_REMOVALS,
     analysis:   weeklyAnalysisCache,
-    activeWL:   USER_WATCHLIST.concat(DYNAMIC_WL_ADDITIONS || [])
+    activeWL:   getActiveWatchlist()
                   .filter((s,i,a) => a.indexOf(s)===i)
                   .filter(s => !(DYNAMIC_WL_REMOVALS||[]).includes(s)),
   });
@@ -3777,7 +3918,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.48.1',
+    version:       '3.48.3',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -5518,6 +5659,30 @@ app.get('/trades/stats', (req, res) => {
     best:   sorted[0]  || null,
     worst:  sorted[sorted.length-1] || null,
   });
+});
+
+// ── TRADES STATS POR ESTRATEGIA ─────────────────────────────────
+app.get('/trades/stats/strategy', (req, res) => {
+  function ss(trades) {
+    const wins=trades.filter(t=>t.win), losses=trades.filter(t=>!t.win);
+    const gW=wins.reduce((s,t)=>s+(t.pnlEur||0),0);
+    const gL=Math.abs(losses.reduce((s,t)=>s+(t.pnlEur||0),0));
+    const byR={};
+    trades.forEach(t=>{ const r=t.exitReason||'?'; if(!byR[r])byR[r]={count:0,wins:0,pnl:0}; byR[r].count++; byR[r].pnl+=t.pnlEur||0; if(t.win)byR[r].wins++; });
+    let cap=0,peak=0,maxDD=0;
+    trades.forEach(t=>{ cap+=t.pnlEur||0; if(cap>peak)peak=cap; const dd=peak>0?(peak-cap)/peak*100:0; if(dd>maxDD)maxDD=dd; });
+    return { trades:trades.length, wins:wins.length, losses:losses.length,
+      winRate:trades.length?(wins.length/trades.length*100).toFixed(1):0,
+      profitFactor:gL>0?(gW/gL).toFixed(2):null,
+      totalPnlEur:Math.round(gW-gL), avgWinEur:wins.length?Math.round(gW/wins.length):0,
+      avgLossEur:losses.length?-Math.round(gL/losses.length):0,
+      maxDrawdownPct:parseFloat(maxDD.toFixed(1)), byExitReason:byR };
+  }
+  res.json({ timestamp:new Date().toISOString(),
+    MOM:ss(tradeHistory.filter(t=>t.system==='MOM')),
+    ORS:ss(tradeHistory.filter(t=>t.system==='ORS')),
+    SWING:ss(tradeHistory.filter(t=>t.system==='SWING')),
+    TOTAL:ss(tradeHistory) });
 });
 
 // ── START ─────────────────────────────────────────────
