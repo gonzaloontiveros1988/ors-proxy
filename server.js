@@ -1051,6 +1051,95 @@ ${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
           if(sold){ delete openPositions[sym]; continue; }
         }
 
+      } else if (pos.system === 'SWING') {
+        // ════════════════════════════════════════════════════
+        // SISTEMA SWING — Pullback en canal MAC
+        // ════════════════════════════════════════════════════
+
+        // SWING→MOM upgrade: precio rompe MAH_1H con gap >1.5% + momentum
+        if (!pos.upgradedToMOM && pos.MAH_1H) {
+          const gapOverMAH = (price - pos.MAH_1H) / pos.MAH_1H;
+          if (gapOverMAH > 0.015 && prices15) {
+            const obvSwUpg  = calcOBV(prices15);
+            const rsiSwUpg  = calcRSI(prices15, 14);
+            const vSwUpg    = prices15.slice(-21).map(p=>p.volume||0);
+            const avgVSwUpg = vSwUpg.slice(0,-1).reduce((s,v)=>s+v,0)/20;
+            const rvolSwUpg = avgVSwUpg > 0 ? vSwUpg[vSwUpg.length-1]/avgVSwUpg : 0;
+            const barsAboveMAH = prices15.length >= 2 &&
+              prices15[prices15.length-2].close > pos.MAH_1H &&
+              prices15[prices15.length-1].close > pos.MAH_1H;
+            if (obvSwUpg?.bullish && obvSwUpg?.rising && rvolSwUpg >= 1.2 &&
+                rsiSwUpg >= 48 && rsiSwUpg <= 72 && barsAboveMAH) {
+              pos.upgradedToMOM = true;
+              pos.system = 'MOM';
+              pos.breakevenDone = true;
+              const swAtr = pos.atrAtEntry || (pos.entryPrice - pos.originalStop);
+              pos.stopPrice = parseFloat((pos.MAH_1H - swAtr * 0.5).toFixed(2));
+              openPositions[sym] = pos;
+              await sendTelegram(
+                `📈→🚀 <b>UPGRADE SWING→MOM — ${sym}</b>\n` +
+                `Rompe MAH $${pos.MAH_1H?.toFixed(2)} con gap +${(gapOverMAH*100).toFixed(1)}%\n` +
+                `Stop → $${pos.stopPrice} | Dejando correr como MOM runner`
+              );
+              console.log(`[SWING→MOM] ${sym} gap=${(gapOverMAH*100).toFixed(1)}%`);
+              continue; // siguiente tick usa lógica MOM
+            }
+          }
+        }
+
+        // PT1: exit parcial en MAH_1H
+        if (!pos.partialDone && pos.MAH_1H && price >= pos.MAH_1H) {
+          pos.partialDone  = true;
+          pos.stopPrice    = parseFloat((pos.entryPrice * 1.002).toFixed(2));
+          pos.breakevenDone= true;
+          openPositions[sym] = pos;
+          await sendTelegram(
+            `🎯 <b>SWING PT1 — ${sym}</b>\n` +
+            `Alcanzó MAH $${pos.MAH_1H?.toFixed(2)} · Stop → Breakeven\n` +
+            `+${gain.toFixed(1)}% · Runner activo`
+          );
+        }
+
+        // Runner EMA20 tras PT1
+        if (pos.breakevenDone && prices15) {
+          const ema20S = calcEMA(prices15, Math.min(20, prices15.length));
+          const obvS   = calcOBV(prices15);
+          if (ema20S && price > ema20S && obvS?.bullish) {
+            const rs = parseFloat(ema20S.toFixed(2));
+            if (rs > pos.stopPrice + 0.20) { pos.stopPrice = rs; pos.isRunner = true; openPositions[sym] = pos; }
+            if (price <= pos.stopPrice) {
+              await executeSell(sym, totalQty, `SWING Runner EMA20 $${pos.stopPrice}`, price);
+              delete openPositions[sym]; continue;
+            }
+          } else if (pos.isRunner) {
+            pos.runnerWeakBars = (pos.runnerWeakBars || 0) + 1;
+            if (pos.runnerWeakBars >= 2) {
+              await executeSell(sym, totalQty, `SWING Runner agotado (+${gain.toFixed(1)}%)`, price);
+              delete openPositions[sym]; continue;
+            }
+            openPositions[sym] = pos;
+          }
+        }
+
+        // N4 agotamiento SWING
+        if (pos.breakevenDone && prices15) {
+          const obv4S  = calcOBV(prices15);
+          const macd4S = calcMACD(prices15);
+          const rsi4S  = calcRSI(prices15, 14);
+          const bc = (!obv4S?.bullish?1:0) + (macd4S?.bearCross?1:0) + (rsi4S>72?1:0);
+          if (bc >= 2) {
+            await executeSell(sym, totalQty, `SWING N4 agotamiento`, price);
+            delete openPositions[sym]; continue;
+          }
+        }
+
+        // Time stop 5 días si PT1 no alcanzado
+        const dSW = (Date.now() - pos.ts) / 86400000;
+        if (dSW > 5 && !pos.breakevenDone) {
+          await executeSell(sym, totalQty, `SWING time stop 5d`, price);
+          delete openPositions[sym]; continue;
+        }
+
       } else {
         // ════════════════════════════════════════════════════
         // SISTEMA ORS — Lógica original con mejoras
@@ -2745,6 +2834,211 @@ async function fetchBatchSnapshots(syms) {
   }
 }
 
+// ── FETCH BARRAS 1H (para sistema SWING) ────────────────────────
+async function fetchAlpaca1H(sym) {
+  try {
+    const end   = new Date().toISOString();
+    const start = new Date(Date.now() - 30*24*60*60*1000).toISOString(); // 30 días
+    let allBars = [], pageToken = null;
+    do {
+      let url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Hour&start=${start}&end=${end}&limit=1000&feed=iex&sort=asc`;
+      if (pageToken) url += `&page_token=${encodeURIComponent(pageToken)}`;
+      const r = await fetch(url, { headers: alpacaHeaders() });
+      const d = await r.json();
+      if (d.bars) d.bars.forEach(b => allBars.push({ t:b.t, open:b.o, high:b.h, low:b.l, close:b.c, volume:b.v }));
+      pageToken = d.next_page_token || null;
+    } while (pageToken && allBars.length < 5000);
+    return allBars.length >= 20 ? allBars : null;
+  } catch(e) { return null; }
+}
+
+// ── SEÑAL SWING (Bernstein MAC Pullback) ─────────────────────────
+// 1H señal: tendencia + pullback a MAL del canal
+// 15min entrada: reversión confirmada (OBV + RVOL)
+function calcSwingSignal(bars1H, prices15) {
+  if (!bars1H || bars1H.length < 52) return null;
+  if (!prices15 || prices15.length < 20) return null;
+  const n1 = bars1H.length;
+  const last1H = bars1H[n1-1].close;
+
+  // Tendencia 1H: precio sobre EMA20 y EMA50
+  const ema20_1H = calcEMA(bars1H, 20);
+  const ema50_1H = calcEMA(bars1H.slice(0, n1), 50);
+  if (!ema20_1H || !ema50_1H || last1H <= ema50_1H) return null;
+
+  // Clasificar tendencia (Teo)
+  const distToEMA20 = (last1H - ema20_1H) / last1H;
+  const trendStrong  = last1H > ema20_1H && distToEMA20 < 0.04;
+  const trendHealthy = last1H <= ema20_1H && last1H > ema50_1H;
+  if (!trendStrong && !trendHealthy) return null;
+
+  // MAC 1H: MAL = SMA8 lows, MAH = SMA10 highs
+  let MAH_1H = 0, MAL_1H = 0;
+  for (let i = n1-10; i < n1; i++) MAH_1H += bars1H[i].high || bars1H[i].close;
+  MAH_1H /= 10;
+  for (let i = n1-8; i < n1; i++) MAL_1H += bars1H[i].low || bars1H[i].close;
+  MAL_1H /= 8;
+
+  // Pullback: precio cerca del MAL
+  const distToMAL = (last1H - MAL_1H) / last1H;
+  const tolerance = trendStrong ? 0.012 : 0.018;
+  if (distToMAL > tolerance) return null;
+  if (distToMAL < -0.025) return null; // demasiado bajo → ORS
+
+  // RSI 1H zona pullback
+  const rsi1H = calcRSI(bars1H, 14);
+  if (!rsi1H || rsi1H < 35 || rsi1H > 55) return null;
+
+  // Buildup suave: no entrar en caídas agresivas (rango > 1.5x ATR)
+  const atr1H = calcATR(bars1H, 14);
+  if (atr1H) {
+    let recentRange = 0;
+    for (let i = n1-3; i < n1; i++) recentRange += (bars1H[i].high||bars1H[i].close)-(bars1H[i].low||bars1H[i].close);
+    recentRange /= 3;
+    if (recentRange > atr1H * 1.5) return null;
+  }
+
+  // Confirmación 15min: vela alcista + OBV bullish + RVOL
+  const last15 = prices15[prices15.length-1];
+  if (!last15.open || last15.close <= last15.open) return null;
+  const obv15 = calcOBV(prices15);
+  if (!obv15 || !obv15.bullish) return null;
+  const vols = prices15.slice(-21).map(p => p.volume||0);
+  const avgVol = vols.slice(0,-1).reduce((s,v)=>s+v,0)/20;
+  const rvol = avgVol > 0 ? vols[vols.length-1]/avgVol : 1;
+  if (rvol < 1.2) return null;
+  if (last15.close < 15) return null;
+
+  const atr15 = calcATR(prices15, 14);
+  if (!atr15) return null;
+  const sma200 = calcSMA(prices15, 200);
+  const trendMult = trendStrong ? 1.0 : 0.75;
+
+  return {
+    last: last15.close, rsi: rsi1H, rvol,
+    atr: atr15, MAH_1H, MAL_1H,
+    trendStrong, trendMultiplier: trendMult,
+    aboveSMA200: sma200 ? last15.close > sma200 : false,
+    score: 60 + Math.round(rvol*8) + (rsi1H<45?10:0) + (trendStrong?15:5),
+    valid: true,
+  };
+}
+
+// ── SCANNER SWING ─────────────────────────────────────────────────
+async function checkSwingSignals() {
+  if (!isMarketEntryAllowed()) return;
+  if (vixSpikeActive) { console.log('[SWING] VIX spike activo — skip'); return; }
+
+  const regime = MARKET_REGIME;
+  console.log(`[SWING] Modo ${regime.mode} | Tickers=${getActiveWatchlist().length}`);
+
+  // SWING activo en BULL y LATERAL — en BEAR pausar
+  if (regime.mode === 'BEAR') {
+    console.log('[SWING] Modo BEAR — SWING pausado');
+    return;
+  }
+
+  // Máximo 1 posición SWING simultánea
+  const swingPositions = Object.values(openPositions).filter(p => p.system === 'SWING');
+  if (swingPositions.length >= 1) return;
+
+  const now = Date.now();
+  const cache1H = {}; // cache de barras 1H esta ejecución
+
+  for (const sym of getActiveWatchlist()) {
+    try {
+      if (!isActive(sym)) continue;
+      if (openPositions[sym]) continue;
+
+      // Filtro mes
+      const _month = new Date().toISOString().slice(0,7);
+      if (monthTradesDone[`${sym}_sw_${_month}`]) continue;
+
+      // Filtro earnings
+      const nearEarnings = await isNearEarnings(sym);
+      if (nearEarnings) continue;
+
+      // Datos 15min
+      let parsed = priceCache[sym];
+      if (!parsed || now - parsed.ts > 5*60*1000) {
+        parsed = await fetchAlpaca15min(sym);
+        if (parsed) priceCache[sym] = { ...parsed, ts: now };
+      }
+      if (!parsed?.prices?.length) continue;
+
+      // Datos 1H
+      let bars1H = cache1H[sym];
+      if (!bars1H) {
+        bars1H = await fetchAlpaca1H(sym);
+        cache1H[sym] = bars1H;
+      }
+      if (!bars1H || bars1H.length < 52) continue;
+
+      const sig = calcSwingSignal(bars1H, parsed.prices);
+      if (!sig || !sig.valid) continue;
+
+      // Sector filter
+      const _symSector = getSector(sym);
+      const _sentKey   = SECTOR_MAP_TO_SENTIMENT[_symSector];
+      const _sent      = _sentKey && sectorSentiment[_sentKey];
+      if (_sent && _sent.status === 'BEARISH' && (_sent.score||50) < 40) continue;
+
+      // Sizing: anti stop-hunting — stop bajo MAL_1H - ATR×0.5
+      const atrAdj    = adjustedATR(sig.atr, sig.last);
+      const swingStop = sig.MAL_1H
+        ? parseFloat((sig.MAL_1H - atrAdj * 0.5).toFixed(2))
+        : parseFloat((sig.last   - atrAdj * 1.0).toFixed(2));
+      const riskPerSh = sig.last - swingStop;
+      if (riskPerSh <= 0) continue;
+
+      const swingSizeMult = (sig.trendMultiplier || 0.75) * (RUNNER_TIER[sym] === 3 ? 0.75 : 1.0);
+      const riskUSD = CAPITAL_EUR * RISK_PCT * 1.08 * swingSizeMult;
+      const qty = capQty(Math.max(1, Math.floor(riskUSD / riskPerSh)), sig.last);
+      const target1 = sig.MAH_1H || parseFloat((sig.last * 1.04).toFixed(2));
+
+      const entryKey = `${sym}_sw_${Math.floor(now/(4*60*60*1000))}`;
+      if (sentAlerts[entryKey]) continue;
+      sentAlerts[entryKey] = now;
+      monthTradesDone[`${sym}_sw_${_month}`] = true;
+
+      const order = {
+        sym, qty, qty1: qty, qty2: 0,
+        price: sig.last, stopPrice: swingStop,
+        originalStop: swingStop,
+        target1, rr: 2.0, atr: sig.atr,
+        isMOM: false, system: 'SWING',
+        MAH_1H: sig.MAH_1H, MAL_1H: sig.MAL_1H,
+        trendStrong: sig.trendStrong,
+      };
+
+      if (AUTO_EXECUTE) {
+        pendingOrders[sym] = order;
+        await executeAlpacaOrder(sym, order);
+        await sendTelegram(
+          `📈 <b>SWING SIGNAL — ${sym}</b>\n` +
+          `💰 $${sig.last.toFixed(2)} | Stop $${swingStop} | Target $${target1}\n` +
+          `📦 ${qty} acc | Riesgo €${Math.round(riskPerSh*qty/1.08)}\n` +
+          `📊 RSI 1H ${sig.rsi?.toFixed(1)} | RVOL ${sig.rvol.toFixed(2)}x\n` +
+          `📐 Tendencia: ${sig.trendStrong ? 'FUERTE ✅' : 'SALUDABLE ⚠️'}\n` +
+          `🏭 Sector: ${_symSector} ${_sent?.status||'NO_DATA'}`
+        );
+      } else {
+        await sendTelegram(
+          `📈 <b>SWING SIGNAL — ${sym}</b>\n\n` +
+          `💰 $${sig.last.toFixed(2)} | Stop: $${swingStop} | Target: $${target1}\n` +
+          `📦 ${qty} acc | Riesgo: €${Math.round(riskPerSh*qty/1.08)}\n` +
+          `📊 RSI 1H ${sig.rsi?.toFixed(1)} | RVOL ${sig.rvol.toFixed(2)}x\n` +
+          `📐 Tendencia: ${sig.trendStrong ? 'FUERTE ✅' : 'SALUDABLE ⚠️'}\n\n` +
+          `✅ /ejecutar_${sym}   ❌ /cancelar_${sym}`
+        );
+      }
+      await new Promise(r => setTimeout(r, 300));
+    } catch(e) {
+      console.log('[SWING]', sym, e.message);
+    }
+  }
+}
+
 // Calcular fuerza relativa de un ticker vs SPY (últimos 5 días)
 function calcRelativeStrength(tickerPrices, spyPrices) {
   if (!tickerPrices || tickerPrices.length < 6 || !spyPrices || spyPrices.length < 6) return null;
@@ -2981,11 +3275,11 @@ async function checkMOMSignals() {
       const entryKey = `${sym}_mom_${_now4h}`;
       if (sentAlerts[entryKey]) continue;
 
-      // ── B: MAX 1 TRADE POR TICKER POR MES ──────────────────────
-      // Reentrar el mismo mes aumenta stops en 7pp (momentum agotado)
+      // ── B: MAX 1 TRADE POR TICKER POR MES (por sistema) ──────────
+      // MOM y ORS no se bloquean mutuamente — universos separados
       const _nowMonth = new Date().toISOString().slice(0,7); // YYYY-MM
-      if (monthTradesDone[sym + '_' + _nowMonth]) {
-        console.log('[B] '+sym+' ya operado este mes — skip');
+      if (monthTradesDone[`${sym}_ors_${_nowMonth}`]) {
+        console.log('[B-ORS] '+sym+' ya operado ORS este mes — skip');
         continue;
       }
 
@@ -3024,7 +3318,7 @@ async function checkMOMSignals() {
 
       sentAlerts[entryKey] = now;
       // Registrar para filtro mensual (B)
-      monthTradesDone[sym + '_' + new Date().toISOString().slice(0,7)] = true;
+      monthTradesDone[`${sym}_mom_${new Date().toISOString().slice(0,7)}`] = true;
 
       if (AUTO_EXECUTE) {
         pendingOrders[sym] = {
@@ -4151,7 +4445,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.2',
+    version:       '3.49.3',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -5979,6 +6273,11 @@ app.listen(PORT, async () => {
   // MOM signals every 5 min (desfasado 2.5min de ORS para no solapar)
   setTimeout(checkMOMSignals, 30000); // 30s tras arranque (era 150s)
   setInterval(checkMOMSignals, 5 * 60 * 1000);
+
+  // SWING signals cada 15min (usa datos 1H — no necesita más frecuencia)
+  // Desfasado 75s de MOM para no solapar llamadas Alpaca
+  setTimeout(checkSwingSignals, 75000);
+  setInterval(checkSwingSignals, 15 * 60 * 1000);
 
   // ── Régimen de mercado — 1x al día al cierre del mercado (20:05 UTC) ────────
   // SMA50/SMA200 son medias de días — no tiene sentido calcularlas cada hora.
