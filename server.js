@@ -81,59 +81,69 @@ const SP500_FULL = [
 
 // Watchlist personal del usuario (para trades manuales y overview)
 const USER_WATCHLIST = (process.env.WATCHLIST || [
-  'NVDA','AMD','AVGO','TSM','MU','MRVL','QCOM','SWKS',
-  'ORCL','META','AMZN','GOOGL','MDB','CRWV','SMCI','CEG',
-  'VST','GEV','BE','TSLA','ISRG','RKLB','LUNR','SATS',
-  'DAL','UAL','AAL','LUV','HCA','INSM','CRSP','ABBV',
-  'ROK','TKO','ZIM','EL','HUT','HUM','GD','AMG',
-  'FDX',
+  // TIER 1 — CORE RUNNERS (runner rate ≥33%, siempre en WL)
+  'ORCL','DAL','HUT','MU','ROK','MDB','FDX',
+  // TIER 2 — SOLID (WR≥40%, P&L positivo)
+  'HUM','EL','AMG','GD','ABBV','INSM',
+  'NVDA','TSM','AVGO','MRVL','QCOM',
+  'AMZN','GOOGL','CRWV',
+  'LUNR','RKLB','SATS',
+  'CEG','GEV','HCA','ISRG',
+  'UAL','AAL',
+  'TSLA','TKO','SMCI','BE','CRSP',
+  // TIER 3 — NUEVOS (solo ORS y SWING — sizing 75%)
+  'PWR','ITW','NOW','DDOG','SNOW','ELV','CI',
 ].join(',')).split(',');
 
 // El scan usa SP500_FULL; la watchlist personal para el home y trades
-// WATCHLIST dinámica — se actualiza cada domingo con el scanner semanal
-// Añade hasta 10 tickers del SP500 con mejor momentum
-let DYNAMIC_WL_ADDITIONS = []; // rellenado por el scanner semanal
-let DYNAMIC_WL_REMOVALS  = []; // tickers temporalmente pausados
-
-// ── SISTEMA DE TRES ESTADOS ──────────────────────────────────────
-// ACTIVE:    scanner 5min + señales automáticas (por defecto)
-// WATCH:     solo scanner semanal — sin señales auto
-//            si momentum score >70 dos semanas → Telegram propone reactivar
-// DISCARDED: fuera definitivamente
-const TICKER_STATUS = {
-  // WATCH — vigilar sin operar (pueden recuperarse)
-  'AMD':   'WATCH',   // 0 runners históricos — puede volver en ciclo AI
-  'VST':   'WATCH',   // 0 runners — energy vol, revisar octubre
-  'META':  'WATCH',   // 0 runners — puede volver con ciclo publicidad
-  'SWKS':  'WATCH',   // 0 runners — semiconductores semi, vigilar
-  // DISCARDED — fuera definitivamente
-  'LUV':   'DISCARDED', // no disponible en Alpaca paper
-  'ZIM':   'DISCARDED', // shipping macro puro, no MOM
-  'SW':    'DISCARDED', // sin datos suficientes
-};
-
-const WATCH_TICKERS = Object.keys(TICKER_STATUS).filter(t => TICKER_STATUS[t] === 'WATCH');
-
-// ¿Puede este ticker generar señales automáticas?
-function isActive(sym) {
-  const s = TICKER_STATUS[sym];
-  return !s || s === 'ACTIVE';
-}
-
-// ¿Incluir en análisis semanal SP500?
-function includeInWeeklyScan(sym) {
-  const s = TICKER_STATUS[sym];
-  return !s || s === 'ACTIVE' || s === 'WATCH';
-}
-
-// Función para obtener la watchlist activa en tiempo real
+// WL dinámica v13 — universos separados + tres estados
+let DYNAMIC_WL_ADDITIONS = [];
+let DYNAMIC_WL_REMOVALS  = [];
 function getActiveWatchlist() {
   return USER_WATCHLIST
     .concat(DYNAMIC_WL_ADDITIONS)
     .filter(s => DYNAMIC_WL_REMOVALS.indexOf(s) < 0)
-    .filter(s => isActive(s))            // solo ACTIVE
-    .filter((s, i, arr) => arr.indexOf(s) === i); // deduplicar
+    .filter(s => isActive(s))
+    .filter((s, i, arr) => arr.indexOf(s) === i);
 }
+function canOperateMOM(sym) { return MOM_TICKERS.indexOf(sym) >= 0; }
+
+// ── SISTEMA TRES ESTADOS ──────────────────────────────────────────
+const TICKER_STATUS = {
+  // WATCH — vigilancia automática semanal
+  // Si recuperan momentum → se añaden a DYNAMIC_WL automáticamente
+  'AMD':   'WATCH',  // 0 runners v13, -€576 — líder AI chips, puede volver
+  'VST':   'WATCH',  // 0 runners, -€546 — energy vol alta
+  'META':  'WATCH',  // 0 runners, -€254 — puede volver con ciclo publicidad
+  'SWKS':  'WATCH',  // 0 runners, -€207 — semiconductores semi
+  'LUV':   'WATCH',  // problema Alpaca paper — verificar en real
+  'ZIM':   'WATCH',  // shipping macro — vigilar ciclo global
+  'SW':    'WATCH',  // sin datos suficientes — monitorizar
+};
+// NOTA: ningún ticker se descarta permanentemente
+// WATCH = sin señales auto pero análisis semanal activo
+// Si score > umbral → pasa a DYNAMIC_WL_ADDITIONS automáticamente
+const WATCH_TICKERS = Object.keys(TICKER_STATUS).filter(t => TICKER_STATUS[t]==='WATCH');
+function isActive(sym) { const s=TICKER_STATUS[sym]; return !s||s==='ACTIVE'; }
+function includeInWeeklyScan(sym) { const s=TICKER_STATUS[sym]; return !s||s==='ACTIVE'||s==='WATCH'; }
+
+// ── UNIVERSOS SEPARADOS (v13) ──────────────────────────────────────
+// MOM: solo Tier1 + Tier2 (stops controlados)
+// ORS + SWING: WL completa incluyendo Tier3 (mayor volatilidad = rebotes más grandes)
+const MOM_TICKERS = ['ORCL','DAL','HUT','MU','ROK','MDB','FDX',
+  'HUM','EL','AMG','GD','ABBV','INSM','NVDA','TSM','AVGO','MRVL','QCOM',
+  'AMZN','GOOGL','CRWV','LUNR','RKLB','SATS','CEG','GEV','HCA','ISRG',
+  'UAL','AAL','TSLA','TKO','SMCI','BE','CRSP'];
+
+// RUNNER TIER para priorización y sizing
+const RUNNER_TIER = {
+  'ORCL':1,'DAL':1,'HUT':1,'MU':1,'ROK':1,'MDB':1,'FDX':1,
+  'HUM':2,'EL':2,'AMG':2,'GD':2,'ABBV':2,'NVDA':2,'TSM':2,'AVGO':2,
+  'MRVL':2,'QCOM':2,'AMZN':2,'GOOGL':2,'LUNR':2,'ISRG':2,'HCA':2,
+  'CEG':2,'GEV':2,'UAL':2,'AAL':2,'TSLA':2,'CRSP':2,'INSM':2,'SMCI':2,'BE':2,'TKO':2,
+  'PWR':3,'ITW':3,'NOW':3,'DDOG':3,'SNOW':3,'ELV':3,'CI':3,
+};
+
 const IBKR_ACCOUNT  = process.env.IBKR_ACCOUNT  || 'U24668151';
 const IBKR_PAPER    = process.env.IBKR_PAPER    || 'DU24668151';
 const IBKR_BASE     = process.env.IBKR_BASE     || 'https://api.ibkr.com/v1/api';
@@ -323,11 +333,11 @@ function capQty(qty, price, is5of5) {
 
 // ── ATR MÍNIMO — evita sizing desproporcionado en tickers baratos ──
 function adjustedATR(atr, price) {
-  const minAtrPct = 0.005; // 0.5% mínimo
+  const minAtrPct = 0.005;
   return (atr / price) < minAtrPct ? price * minAtrPct : atr;
 }
 
-// ── MAC FILTER (Bernstein) ────────────────────────────────────────
+// ── MAC FILTER (Bernstein) ─────────────────────────────────────────
 function calcMAC(prices) {
   if (!prices || prices.length < 10) return null;
   const MAH = prices.slice(-10).reduce((s,c) => s+(c.high||c.close),0)/10;
@@ -339,17 +349,90 @@ function macFilter(prices, close, atr) {
   if (!mac) return { pass: true, reason: 'MAC:insuf' };
   if (mac.width < atr*0.25) return { pass: false, reason: 'MAC:comprimido' };
   return close > mac.MAH
-    ? { pass: true,  reason: `MAC:OK(>${mac.MAH.toFixed(2)})` }
-    : { pass: false, reason: `MAC:dentro_canal(MAH:${mac.MAH.toFixed(2)})` };
+    ? { pass: true,  reason: `MAC:OK` }
+    : { pass: false, reason: `MAC:dentro_canal` };
 }
 
-// ── 8OC FILTER (Bernstein Eight-Bar Open/Close) ───────────────────
+// ── 8OC FILTER (Bernstein Eight-Bar Open/Close) ────────────────────
 function eightBarFilter(prices, atr) {
   if (!prices || prices.length < 8) return { pass: true, reason: '8OC:insuf' };
   const score = prices.slice(-8).reduce((s,c) => s+((c.close||c.c)-(c.open||c.o||c.close)),0);
   return score > -(atr*0.1)
-    ? { pass: true,  reason: `8OC:OK(${score.toFixed(3)})` }
-    : { pass: false, reason: `8OC:negativo(${score.toFixed(3)})` };
+    ? { pass: true,  reason: `8OC:OK` }
+    : { pass: false, reason: `8OC:negativo` };
+}
+
+// ── FIVE-BAR MAC PATTERN (Bernstein) ──────────────────────────────
+// 3+ velas consecutivas sobre MAH = breakout genuino (no spike falso)
+function fiveBarMACPattern(prices) {
+  if (!prices || prices.length < 15) return true;
+  const mac = calcMAC(prices);
+  if (!mac) return true;
+  let count = 0;
+  for (let i = prices.length-1; i >= Math.max(0, prices.length-10); i--) {
+    if ((prices[i].close||prices[i].c||0) > mac.MAH) count++;
+    else break;
+  }
+  return count >= 3;
+}
+
+// ── VIX SPIKE DETECTOR ────────────────────────────────────────────
+// Si VIX sube >30% en 24h → pausa entradas nuevas
+let lastVIX = null;
+let vixSpikeActive = false;
+let vixSpikeUntil  = null;
+function updateVIXSpike(currentVIX) {
+  if (!currentVIX) return;
+  if (lastVIX && lastVIX > 0) {
+    const change = (currentVIX - lastVIX) / lastVIX;
+    if (change > 0.30) {
+      vixSpikeActive = true;
+      vixSpikeUntil  = Date.now() + 48*60*60*1000; // 48h
+      console.log(`[VIX SPIKE] ${lastVIX.toFixed(1)}→${currentVIX.toFixed(1)} (+${(change*100).toFixed(0)}%) — entradas bloqueadas 48h`);
+      sendTelegram(`⚠️ <b>VIX SPIKE DETECTADO</b>
+VIX: ${lastVIX.toFixed(1)} → ${currentVIX.toFixed(1)} (+${(change*100).toFixed(0)}%)
+🛑 Entradas bloqueadas 48h por protección macro`);
+    }
+  }
+  if (vixSpikeActive && vixSpikeUntil && Date.now() > vixSpikeUntil) {
+    vixSpikeActive = false;
+    vixSpikeUntil  = null;
+    console.log('[VIX SPIKE] Bloqueo levantado — entradas normales');
+    sendTelegram('✅ <b>VIX normalizado</b> — Entradas reanudadas');
+  }
+  lastVIX = currentVIX;
+}
+
+// ── SECTOR CRASH BLOCK ────────────────────────────────────────────
+// Si ETF sector cae >4% hoy → no ORS en ese sector
+const SECTOR_FOR_TICKER = {
+  NVDA:'AI_CHIPS',AMD:'AI_CHIPS',AVGO:'AI_CHIPS',TSM:'AI_CHIPS',
+  MU:'AI_CHIPS',MRVL:'AI_CHIPS',QCOM:'AI_CHIPS',SMCI:'AI_CHIPS',
+  ORCL:'CLOUD',META:'CLOUD',AMZN:'CLOUD',GOOGL:'CLOUD',
+  MDB:'CLOUD',CRWV:'CLOUD',NOW:'CLOUD',DDOG:'CLOUD',SNOW:'CLOUD',
+  CEG:'NUCLEAR',GEV:'NUCLEAR',VST:'NUCLEAR',
+  DAL:'AIRLINES',UAL:'AIRLINES',AAL:'AIRLINES',LUV:'AIRLINES',
+  ROK:'INDUSTRIAL',ITW:'INDUSTRIAL',PWR:'INDUSTRIAL',FDX:'INDUSTRIAL',
+  GD:'INDUSTRIAL',AMG:'INDUSTRIAL',
+  HCA:'HEALTHCARE',ISRG:'HEALTHCARE',HUM:'HEALTHCARE',ELV:'HEALTHCARE',CI:'HEALTHCARE',
+  INSM:'BIOTECH',CRSP:'BIOTECH',ABBV:'BIOTECH',
+  RKLB:'SPACE',LUNR:'SPACE',SATS:'SPACE',
+  HUT:'CRYPTO',TKO:'MEDIA',BE:'GREEN',EL:'CONSUMER',TSLA:'EV',
+};
+let crashedSectorsToday = new Set();
+function updateSectorCrashBlock(sectorChanges) {
+  crashedSectorsToday = new Set();
+  if (!sectorChanges) return;
+  Object.entries(sectorChanges).forEach(([sector, change]) => {
+    if (change <= -0.04) {
+      crashedSectorsToday.add(sector);
+      console.log(`[SECTOR CRASH] ${sector}: ${(change*100).toFixed(1)}% — ORS bloqueado`);
+    }
+  });
+}
+function isORSBlockedBySectorCrash(sym) {
+  const sector = SECTOR_FOR_TICKER[sym];
+  return sector && crashedSectorsToday.has(sector);
 }
 
 async function executeAlpacaOrder(sym, order) {
@@ -359,31 +442,37 @@ async function executeAlpacaOrder(sym, order) {
     await sendTelegram(`🚫 ORDEN BLOQUEADA: ${sym} — Mercado cerrado. No se ejecuta ninguna operación fuera del horario NYSE (Lun-Vie 13:30-20:00 UTC)`);
     return null;
   }
-
-  // ── VERIFICAR ESTADO TICKER ──────────────────────────────────────────────────
+  // ── VERIFICAR ESTADO TICKER ──────────────────────────────────────
   if (!isActive(sym)) {
-    console.log(`[BLOCKED] ${sym}: estado ${TICKER_STATUS[sym]} — no operar`);
-    delete pendingOrders[sym];
+    console.log(`[BLOCKED] ${sym}: estado ${TICKER_STATUS[sym]}`);
+    delete pendingOrders[sym]; return null;
+  }
+
+  // ── VIX SPIKE DETECTOR ────────────────────────────────────────────
+  if (vixSpikeActive) {
+    console.log(`[BLOCKED] ${sym}: VIX spike activo — entradas bloqueadas`);
+    await sendTelegram(`🛑 Orden bloqueada (${sym}) — VIX spike activo. Usa /emergencia OFF para reanudar.`);
     return null;
   }
 
-  // ── VERIFICAR ASSET TRADABLE EN ALPACA ───────────────────────────────────────
-  try {
-    const assetResp = await fetch(`${alpacaBase()}/v2/assets/${sym}`, { headers: alpacaHeaders() });
-    const assetText = await assetResp.text();
-    let asset;
-    try { asset = JSON.parse(assetText); } catch(e) { asset = null; }
-    if (!asset || asset.tradable === false || asset.status !== 'active') {
-      const reason = !asset ? 'respuesta inválida' : (!asset.tradable ? 'not tradable' : `status: ${asset.status}`);
-      console.log(`[BLOCKED] ${sym}: asset no operable en Alpaca — ${reason}`);
-      await sendTelegram(`⚠️ <b>Señal bloqueada — ${sym}</b>\nNo disponible en Alpaca paper (${reason}). Eliminar de watchlist.`);
-      delete pendingOrders[sym];
-      return null;
-    }
-    console.log(`[ASSET OK] ${sym}: tradable=${asset.tradable} status=${asset.status}`);
-  } catch(assetErr) {
-    console.log(`[ASSET CHECK ERROR] ${sym}: ${assetErr.message} — continuando`);
+  // ── SECTOR CRASH BLOCK (solo ORS) ────────────────────────────────
+  if (!order.isMOM && isORSBlockedBySectorCrash(sym)) {
+    console.log(`[BLOCKED] ${sym}: sector crash block activo`);
+    return null;
   }
+
+  // ── VERIFICAR ASSET TRADABLE EN ALPACA ───────────────────────────
+  try {
+    const ar = await fetch(`${alpacaBase()}/v2/assets/${sym}`, { headers: alpacaHeaders() });
+    const at = await ar.text();
+    let asset; try { asset = JSON.parse(at); } catch(e) { asset = null; }
+    if (!asset || asset.tradable === false || asset.status !== 'active') {
+      const reason = !asset ? 'respuesta inválida' : (!asset.tradable ? 'not tradable' : `status:${asset.status}`);
+      console.log(`[BLOCKED] ${sym}: ${reason}`);
+      await sendTelegram(`⚠️ <b>${sym}</b> no disponible en Alpaca (${reason}). Considera eliminarlo de la watchlist.`);
+      delete pendingOrders[sym]; return null;
+    }
+  } catch(e) { console.log(`[ASSET CHECK] ${sym}: ${e.message} — continuando`); }
 
   const acc = getAcc();
   const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
@@ -429,9 +518,10 @@ async function executeAlpacaOrder(sym, order) {
       entryPrice: order.price, stopPrice: order.stopPrice,
       originalStop: order.stopPrice,
       target1: order.target1, rr: order.rr,
-      pt1Price: parseFloat((order.price + _atrPT * 1.5).toFixed(2)),
-      pt2Price: parseFloat((order.price + _atrPT * 3.0).toFixed(2)),
+      pt1Price:  parseFloat((order.price + _atrPT * 1.5).toFixed(2)),
+      pt2Price:  parseFloat((order.price + _atrPT * 3.0).toFixed(2)),
       pt1Hit: false, pt2Hit: false,
+      dangerZoneDone: false,
       stopOrderId: stopOrder.id,
       buyOrderId: buyOrder.id,
       phase2Done: false, ts: Date.now(),
@@ -439,6 +529,7 @@ async function executeAlpacaOrder(sym, order) {
       maxPrice: order.price,
       trailingPct: 4,
       system: order.isMOM ? 'MOM' : 'ORS',
+      runnerTier: RUNNER_TIER[sym] || 0,
     };
 
     // 4. Log de decisión — captura todas las condiciones
@@ -770,26 +861,53 @@ async function manageTrailingStops() {
       // NIVEL 1 — Stop loss fijo (igual para ORS y MOM)
       // ══════════════════════════════════════════════════════
 
+      // ── DANGER ZONE (Bernstein) ───────────────────────────────
+      // Si en las primeras 4-7 bars no sube >0.3% → stop al 50% del riesgo
+      const barsHeldDZ = Math.round((Date.now() - pos.ts) / (15*60*1000));
+      if (!pos.dangerZoneDone && !pos.breakevenDone && barsHeldDZ >= 4 && barsHeldDZ <= 7) {
+        const gainDZ = (price - pos.entryPrice) / pos.entryPrice * 100;
+        if (gainDZ < 0.3) {
+          const halfRisk = pos.entryPrice - (pos.entryPrice - pos.originalStop) * 0.50;
+          const newStop  = parseFloat(halfRisk.toFixed(2));
+          if (newStop > pos.stopPrice) {
+            pos.stopPrice      = newStop;
+            pos.dangerZoneDone = true;
+            openPositions[sym] = pos;
+            console.log(`[DANGER ZONE] ${sym} stop ajustado a $${newStop} (50% riesgo)`);
+          }
+        } else {
+          pos.dangerZoneDone = true;
+          openPositions[sym] = pos;
+        }
+      }
+
       // ── PT1/PT2 SCALED EXIT ───────────────────────────────────
       if (pos.pt1Price && !pos.pt1Hit && price >= pos.pt1Price) {
         pos.pt1Hit = true;
         try {
-          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
-            body: JSON.stringify({ symbol: sym, qty: String(pos.qty1), side:'sell', type:'market', time_in_force:'day' }) });
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST',
+            headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol:sym, qty:String(pos.qty1), side:'sell', type:'market', time_in_force:'day' }) });
           pos.stopPrice = parseFloat((pos.entryPrice*1.002).toFixed(2));
           pos.breakevenDone = true;
           openPositions[sym] = pos;
           const pnl = Math.round((price-pos.entryPrice)*pos.qty1/1.08);
-          await sendTelegram(`🎯 <b>PT1 ALCANZADO — ${sym}</b>\nCerrado ${pos.qty1} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🛡 Stop → Breakeven $${pos.stopPrice}\n⏳ PT2: $${pos.pt2Price}`);
+          await sendTelegram(`🎯 <b>PT1 — ${sym}</b>
+${pos.qty1} acc @ $${price.toFixed(2)} · +€${pnl}
+🛡 Stop → Breakeven $${pos.stopPrice}
+⏳ PT2: $${pos.pt2Price}`);
         } catch(e) { console.error('[PT1]', sym, e.message); }
       }
       if (pos.pt2Price && pos.pt1Hit && !pos.pt2Hit && price >= pos.pt2Price) {
         pos.pt2Hit = true;
         try {
-          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST', headers:{...alpacaHeaders(),'Content-Type':'application/json'},
-            body: JSON.stringify({ symbol: sym, qty: String(pos.qty2), side:'sell', type:'market', time_in_force:'day' }) });
+          await fetch(`${alpacaBase()}/v2/orders`, { method:'POST',
+            headers:{...alpacaHeaders(),'Content-Type':'application/json'},
+            body: JSON.stringify({ symbol:sym, qty:String(pos.qty2), side:'sell', type:'market', time_in_force:'day' }) });
           const pnl = Math.round((price-pos.entryPrice)*pos.qty2/1.08);
-          await sendTelegram(`✅ <b>PT2 ALCANZADO — ${sym}</b>\nCerrado ${pos.qty2} acc @ $${price.toFixed(2)} · P&L: +€${pnl}\n🏁 Posición COMPLETA`);
+          await sendTelegram(`✅ <b>PT2 — ${sym}</b>
+${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
+🏁 Posición completa`);
           delete openPositions[sym]; continue;
         } catch(e) { console.error('[PT2]', sym, e.message); }
       }
@@ -2292,22 +2410,63 @@ async function pollTelegramCommands() {
         const sym = text.split(' ')[1]?.toUpperCase();
         if (sym && TICKER_STATUS[sym] === 'WATCH') {
           delete TICKER_STATUS[sym];
-          await sendTelegram(`✅ <b>${sym} reactivado → ACTIVE</b>\nEl scanner generará señales normalmente.`);
-        } else if (sym) {
-          await sendTelegram(`ℹ️ ${sym} ya está ACTIVE o no se puede reactivar (${TICKER_STATUS[sym]||'ACTIVE'})`);
+          await sendTelegram(`✅ <b>${sym} → ACTIVE</b>
+El scanner generará señales normalmente.`);
+        } else {
+          await sendTelegram(`ℹ️ ${sym||'?'} ya está ACTIVE o no existe`);
         }
       }
       else if (text.startsWith('/pausar ')) {
         const sym = text.split(' ')[1]?.toUpperCase();
         if (sym) {
           TICKER_STATUS[sym] = 'WATCH';
-          await sendTelegram(`👁 <b>${sym} → WATCH</b>\nSin señales auto. El scanner semanal lo monitoriza.`);
+          await sendTelegram(`👁 <b>${sym} → WATCH</b>
+Sin señales auto. Scanner semanal lo monitoriza.`);
         }
       }
       else if (text === '/estados') {
         const watch = Object.entries(TICKER_STATUS).filter(([,v])=>v==='WATCH').map(([k])=>k);
         const disc  = Object.entries(TICKER_STATUS).filter(([,v])=>v==='DISCARDED').map(([k])=>k);
-        await sendTelegram(`📊 <b>Estados tickers</b>\n👁 WATCH: ${watch.join(', ')||'ninguno'}\n❌ DISCARDED: ${disc.join(', ')||'ninguno'}\n\nUsa /reactivar TICKER o /pausar TICKER`);
+        await sendTelegram(`📊 <b>Estados tickers</b>
+👁 WATCH: ${watch.join(', ')||'ninguno'}
+❌ DISCARDED: ${disc.join(', ')||'ninguno'}
+
+/reactivar TICKER | /pausar TICKER`);
+      }
+      else if (text === '/watchlist') {
+        const active = getActiveWatchlist();
+        const dwl    = DYNAMIC_WL_ADDITIONS;
+        const watch  = WATCH_TICKERS;
+        let msg = `📋 <b>Watchlist actual</b>
+
+`;
+        msg += `🟢 <b>Activos (${active.length}):</b> ${active.slice(0,20).join(', ')}${active.length>20?'...':''}
+
+`;
+        if (dwl.length) msg += `⚡ <b>Dinámica (${dwl.length}):</b> ${dwl.join(', ')}
+
+`;
+        msg += `👁 <b>WATCH (${watch.length}):</b> ${watch.join(', ')}
+
+`;
+        msg += `Total universo: ${active.length} tickers activos
+Scanner semanal: ${active.length + watch.length} tickers`;
+        await sendTelegram(msg);
+      }
+      else if (text === '/emergencia ON' || text === '/emergencia on') {
+        vixSpikeActive = true;
+        vixSpikeUntil  = null; // manual — no expira solo
+        await sendTelegram('🚨 <b>EMERGENCIA ACTIVADA</b>
+Entradas bloqueadas indefinidamente.
+Usa /emergencia OFF para reanudar.');
+        console.log('[EMERGENCIA] Kill switch activado manualmente');
+      }
+      else if (text === '/emergencia OFF' || text === '/emergencia off') {
+        vixSpikeActive = false;
+        vixSpikeUntil  = null;
+        await sendTelegram('✅ <b>Emergencia desactivada</b>
+Entradas reanudadas normalmente.');
+        console.log('[EMERGENCIA] Kill switch desactivado');
       }
       else if (text === '/ayuda' || text === '/help' || text === '/start') {
         await sendTelegram(
@@ -2322,7 +2481,12 @@ async function pollTelegramCommands() {
           '/posiciones — Ver posiciones Alpaca/IBKR\n' +
           '/estado — Estado del servidor\n' +
           '/señales — Escaneo manual ahora\n' +
-          '/ayuda — Este menú\n\n' +
+          '/ayuda — Este menú\n' +
+          '/watchlist — Ver watchlist activa, dinámica y WATCH\n' +
+          '/estados — Estado de tickers WATCH/DISCARDED\n' +
+          '/reactivar TICKER — Mover ticker a activo\n' +
+          '/pausar TICKER — Mover ticker a WATCH\n' +
+          '/emergencia ON/OFF — Kill switch manual\n' +
           '⚠️ 10 min para confirmar · Sin necesidad de TradingView'
         );
       }
@@ -3704,6 +3868,80 @@ Responde en formato JSON:
           .filter(a => a.rec === 'AÑADIR')
           .map(a => a.sym);
         DYNAMIC_WL_ADDITIONS = confirmed.filter(s => USER_WATCHLIST.indexOf(s) < 0);
+
+    // ── CAPA 2: WATCH → DYNAMIC_WL automático ───────────────────────
+    // Si un ticker WATCH supera el umbral de score → se añade a la
+    // watchlist dinámica automáticamente sin intervención manual
+    const WATCH_AUTO_THRESHOLD = 68; // score mínimo para reactivación auto
+    const WATCH_REMOVE_THRESHOLD = 45; // score mínimo para mantenerse en DWL
+    
+    const watchRecovered = [];
+    const watchWeak = [];
+    
+    for (const [sym, score] of topCandidates) {
+      if (WATCH_TICKERS.indexOf(sym) < 0) continue;
+      
+      if (score >= WATCH_AUTO_THRESHOLD) {
+        // Score alto → añadir a watchlist dinámica automáticamente
+        if (DYNAMIC_WL_ADDITIONS.indexOf(sym) < 0) {
+          DYNAMIC_WL_ADDITIONS.push(sym);
+          watchRecovered.push({ sym, score: score.toFixed(0) });
+          console.log(`[WATCH→ACTIVE] ${sym} score:${score.toFixed(0)} → añadido a WL dinámica`);
+        }
+      } else if (score < WATCH_REMOVE_THRESHOLD) {
+        // Score bajo → si estaba en DWL, sacarlo
+        const idx = DYNAMIC_WL_ADDITIONS.indexOf(sym);
+        if (idx >= 0) {
+          DYNAMIC_WL_ADDITIONS.splice(idx, 1);
+          watchWeak.push({ sym, score: score.toFixed(0) });
+          console.log(`[WATCH→REMOVE] ${sym} score:${score.toFixed(0)} → eliminado de WL dinámica`);
+        }
+      }
+    }
+    
+    // Telegram con resumen de cambios automáticos
+    if (watchRecovered.length || watchWeak.length) {
+      let msg = `🔄 <b>Watchlist dinámica actualizada</b>
+`;
+      if (watchRecovered.length) {
+        msg += `
+✅ <b>Añadidos automáticamente:</b>
+`;
+        watchRecovered.forEach(({sym, score}) => {
+          msg += `  📈 ${sym} — score ${score}pts (>${WATCH_AUTO_THRESHOLD} umbral)
+`;
+        });
+      }
+      if (watchWeak.length) {
+        msg += `
+⬇️ <b>Eliminados por bajo momentum:</b>
+`;
+        watchWeak.forEach(({sym, score}) => {
+          msg += `  📉 ${sym} — score ${score}pts (<${WATCH_REMOVE_THRESHOLD} umbral)
+`;
+        });
+      }
+      msg += `
+WL activa: ${getActiveWatchlist().length} tickers
+Usa /estados para ver el detalle.`;
+      await sendTelegram(msg);
+    }
+    
+    // Resumen WATCH tickers aunque no haya cambios
+    const watchStatus = WATCH_TICKERS.map(sym => {
+      const entry = topCandidates.find(([s]) => s === sym);
+      const score = entry ? entry[1].toFixed(0) : '—';
+      const inDWL = DYNAMIC_WL_ADDITIONS.indexOf(sym) >= 0;
+      return `${sym}(${score}pts${inDWL ? ' 🟢DWL' : ''})`;
+    }).join(' | ');
+    
+    if (watchStatus) {
+      await sendTelegram(`👁 <b>Estado WATCH semanal</b>
+${watchStatus}
+
+Umbral auto-activación: ${WATCH_AUTO_THRESHOLD}pts
+Umbral eliminación: ${WATCH_REMOVE_THRESHOLD}pts`);
+    }
         weeklyAnalysisCache  = analysis;
       } catch (e) { /* usar resultado sin Claude */ }
     }
@@ -3722,26 +3960,6 @@ Responde en formato JSON:
       + `WL activa: ${USER_WATCHLIST.length + DYNAMIC_WL_ADDITIONS.length} tickers`;
     await sendTelegram(msg).catch(() => {});
     console.log('[WEEKLY] Completado. Añadidos:', DYNAMIC_WL_ADDITIONS, '| Pausados:', DYNAMIC_WL_REMOVALS);
-
-    // ── Evaluar tickers WATCH — proponer reactivación si momentum fuerte ──
-    const watchResults = [];
-    for (const sym of WATCH_TICKERS) {
-      const symData = topCandidates.find(([s]) => s === sym);
-      if (symData && symData[1] > 65) { // score > 65
-        watchResults.push({ sym, score: symData[1].toFixed(1) });
-      }
-    }
-    if (watchResults.length) {
-      const watchMsg = watchResults.map(w => `${w.sym}(score:${w.score})`).join(', ');
-      await sendTelegram(
-        `👁 <b>WATCH — Tickers recuperándose</b>\n` +
-        `${watchMsg}\n\n` +
-        `Estos tickers están en WATCH (sin señales auto).\n` +
-        `Si mantienen momentum 2 semanas → considera reactivar.\n` +
-        `Usa /reactivar TICKER para moverlos a ACTIVE.`
-      );
-      console.log('[WEEKLY] WATCH con momentum:', watchResults);
-    }
 
   } catch (e) {
     console.log('[WEEKLY] Error:', e.message);
@@ -3820,7 +4038,7 @@ app.get('/weekly/analysis', (req, res) => {
     additions:  DYNAMIC_WL_ADDITIONS,
     removals:   DYNAMIC_WL_REMOVALS,
     analysis:   weeklyAnalysisCache,
-    activeWL:   getActiveWatchlist()
+    activeWL:   USER_WATCHLIST.concat(DYNAMIC_WL_ADDITIONS || [])
                   .filter((s,i,a) => a.indexOf(s)===i)
                   .filter(s => !(DYNAMIC_WL_REMOVALS||[]).includes(s)),
   });
@@ -3918,7 +4136,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.48.3',
+    version:       '3.49.1',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -5664,25 +5882,25 @@ app.get('/trades/stats', (req, res) => {
 // ── TRADES STATS POR ESTRATEGIA ─────────────────────────────────
 app.get('/trades/stats/strategy', (req, res) => {
   function ss(trades) {
-    const wins=trades.filter(t=>t.win), losses=trades.filter(t=>!t.win);
+    const wins=trades.filter(t=>t.win), loses=trades.filter(t=>!t.win);
     const gW=wins.reduce((s,t)=>s+(t.pnlEur||0),0);
-    const gL=Math.abs(losses.reduce((s,t)=>s+(t.pnlEur||0),0));
-    const byR={};
-    trades.forEach(t=>{ const r=t.exitReason||'?'; if(!byR[r])byR[r]={count:0,wins:0,pnl:0}; byR[r].count++; byR[r].pnl+=t.pnlEur||0; if(t.win)byR[r].wins++; });
+    const gL=Math.abs(loses.reduce((s,t)=>s+(t.pnlEur||0),0));
     let cap=0,peak=0,maxDD=0;
-    trades.forEach(t=>{ cap+=t.pnlEur||0; if(cap>peak)peak=cap; const dd=peak>0?(peak-cap)/peak*100:0; if(dd>maxDD)maxDD=dd; });
-    return { trades:trades.length, wins:wins.length, losses:losses.length,
+    trades.forEach(t=>{cap+=t.pnlEur||0;if(cap>peak)peak=cap;const dd=peak>0?(peak-cap)/peak*100:0;if(dd>maxDD)maxDD=dd;});
+    const byR={};
+    trades.forEach(t=>{const r=t.exitReason||'?';if(!byR[r])byR[r]={count:0,wins:0,pnl:0};byR[r].count++;byR[r].pnl+=t.pnlEur||0;if(t.win)byR[r].wins++;});
+    return {trades:trades.length,wins:wins.length,losses:loses.length,
       winRate:trades.length?(wins.length/trades.length*100).toFixed(1):0,
       profitFactor:gL>0?(gW/gL).toFixed(2):null,
-      totalPnlEur:Math.round(gW-gL), avgWinEur:wins.length?Math.round(gW/wins.length):0,
-      avgLossEur:losses.length?-Math.round(gL/losses.length):0,
-      maxDrawdownPct:parseFloat(maxDD.toFixed(1)), byExitReason:byR };
+      totalPnlEur:Math.round(gW-gL),avgWinEur:wins.length?Math.round(gW/wins.length):0,
+      avgLossEur:loses.length?-Math.round(gL/loses.length):0,
+      maxDrawdownPct:parseFloat(maxDD.toFixed(1)),byExitReason:byR};
   }
-  res.json({ timestamp:new Date().toISOString(),
+  res.json({timestamp:new Date().toISOString(),
     MOM:ss(tradeHistory.filter(t=>t.system==='MOM')),
     ORS:ss(tradeHistory.filter(t=>t.system==='ORS')),
     SWING:ss(tradeHistory.filter(t=>t.system==='SWING')),
-    TOTAL:ss(tradeHistory) });
+    TOTAL:ss(tradeHistory)});
 });
 
 // ── START ─────────────────────────────────────────────
@@ -5797,7 +6015,9 @@ app.listen(PORT, async () => {
     if(!Object.keys(openPositions).length) return;
     const nyH = parseInt(new Date().toLocaleString('en-US',{timeZone:'America/New_York',hour:'numeric',hour12:false}));
     if(nyH>=9&&nyH<16) {
-      await manageTrailingStops();
+      // Actualizar VIX spike detector con dato actual
+    if (typeof latestVIX !== 'undefined') updateVIXSpike(latestVIX);
+    await manageTrailingStops();
       await checkAggressiveBreakeven(); // Breakeven agresivo a +1.5%
     }
   }, 3 * 60 * 1000);
