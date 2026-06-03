@@ -148,7 +148,48 @@ const IBKR_ACCOUNT  = process.env.IBKR_ACCOUNT  || 'U24668151';
 const IBKR_PAPER    = process.env.IBKR_PAPER    || 'DU24668151';
 const IBKR_BASE     = process.env.IBKR_BASE     || 'https://api.ibkr.com/v1/api';
 let CAPITAL_EUR   = parseFloat(process.env.CAPITAL_EUR || '11480');
-const RISK_PCT      = parseFloat(process.env.RISK_PCT    || '0.02');
+const RISK_PCT_BASE = parseFloat(process.env.RISK_PCT || '0.02'); // 2% base
+let   RISK_PCT      = RISK_PCT_BASE; // puede reducirse a 1% por drawdown adaptativo
+let   adaptiveDDActive = false;
+
+// ── DRAWDOWN ADAPTATIVO ────────────────────────────────────────────
+// Si pérdida mensual >5% del capital → bajar riesgo a 1% automáticamente
+// Cuando recupera el nivel inicial del mes → volver a 2%
+let monthStartCapital = null;
+async function checkAdaptiveDrawdown() {
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/account`, {headers: alpacaHeaders()});
+    const acc = await r.json();
+    const currentCapital = parseFloat(acc.equity || acc.portfolio_value || 0) / 1.08;
+    if (!monthStartCapital) {
+      monthStartCapital = currentCapital;
+      return;
+    }
+    const monthDD = (monthStartCapital - currentCapital) / monthStartCapital * 100;
+    if (monthDD >= 5 && !adaptiveDDActive) {
+      adaptiveDDActive = true;
+      RISK_PCT = RISK_PCT_BASE * 0.5; // 1%
+      console.log(`[DD ADAPTATIVO] Activado — DD mensual ${monthDD.toFixed(1)}% → RISK reducido a ${(RISK_PCT*100).toFixed(0)}%`);
+      await sendTelegram(
+        `⚠️ <b>DRAWDOWN ADAPTATIVO ACTIVADO</b>\n` +
+        `DD mensual: -${monthDD.toFixed(1)}% (límite 5%)\n` +
+        `Riesgo por trade: 2% → 1%\n` +
+        `Se restaura cuando recupere el capital del mes.`
+      );
+    } else if (adaptiveDDActive && currentCapital >= monthStartCapital * 0.99) {
+      adaptiveDDActive = false;
+      RISK_PCT = RISK_PCT_BASE; // 2%
+      console.log(`[DD ADAPTATIVO] Desactivado — capital recuperado`);
+      await sendTelegram(
+        `✅ <b>Riesgo restaurado al 2%</b>\n` +
+        `Capital recuperado — DD mensual normalizado.`
+      );
+    }
+    // Reset capital inicio de mes
+    const dayOfMonth = new Date().getUTCDate();
+    if (dayOfMonth === 1) monthStartCapital = currentCapital;
+  } catch(e) { console.log('[DD ADAPTATIVO]', e.message); }
+}
 const USE_PAPER     = process.env.USE_PAPER !== 'false';
 
 // ── ALPACA 3 CUENTAS ──────────────────────────────────
@@ -303,9 +344,32 @@ const openPositions = {};
 const monthTradesDone = {}; // sym_YYYY-MM -> true (max 1 trade/ticker/mes)
 let scanMOMCache = null;    // caché del último scan MOM — BUG FIX: era local al endpoint // sym → {qty, entryPrice, stopPrice, target, stopOrderId, ts}
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
-const MAX_POSITIONS     = parseInt(process.env.MAX_POSITIONS || '4');
-const MAX_POSITIONS_ORS = parseInt(process.env.MAX_POSITIONS_ORS || '1'); // ORS máximo 1 — oportunista
-const MAX_POSITIONS_MOM = parseInt(process.env.MAX_POSITIONS_MOM || '4'); // MOM usa todos los slots
+const MAX_POSITIONS     = parseInt(process.env.MAX_POSITIONS || '5'); // 5 slots total
+
+// Límites por régimen de mercado (calculados dinámicamente)
+// BULL:    MOM≤3  ORS≤1  SWING≤1
+// LATERAL: MOM≤2  ORS≤2  SWING≤1
+// BEAR:    MOM≤0  ORS≤2  SWING≤0
+function getMaxBySystem(system) {
+  const mode = MARKET_REGIME?.mode || 'BULL';
+  const limits = {
+    BULL:    { MOM: 3, ORS: 1, SWING: 1 },
+    LATERAL: { MOM: 2, ORS: 2, SWING: 1 },
+    BEAR:    { MOM: 0, ORS: 2, SWING: 0 },
+  };
+  return (limits[mode] || limits.BULL)[system] || 0;
+}
+function countSystem(system) {
+  return Object.values(openPositions).filter(p => (p.system||p.type) === system).length;
+}
+function canOpenPosition(system) {
+  const total = Object.keys(openPositions).length;
+  if (total >= MAX_POSITIONS) return false;
+  return countSystem(system) < getMaxBySystem(system);
+}
+// Compatibilidad con código existente
+const MAX_POSITIONS_ORS = 2; // máx absoluto (régimen puede limitarlo más)
+const MAX_POSITIONS_MOM = 3; // máx absoluto
 
 // Contar posiciones abiertas por sistema
 function countORSPositions() {
@@ -2938,9 +3002,8 @@ async function checkSwingSignals() {
     return;
   }
 
-  // Máximo 1 posición SWING simultánea
-  const swingPositions = Object.values(openPositions).filter(p => p.system === 'SWING');
-  if (swingPositions.length >= 1) return;
+  // Slots SWING por régimen (BULL: 1, LATERAL: 1, BEAR: 0)
+  if (!canOpenPosition('SWING')) return;
 
   const now = Date.now();
   const cache1H = {}; // cache de barras 1H esta ejecución
@@ -2991,7 +3054,9 @@ async function checkSwingSignals() {
       const riskPerSh = sig.last - swingStop;
       if (riskPerSh <= 0) continue;
 
-      const swingSizeMult = (sig.trendMultiplier || 0.75) * (RUNNER_TIER[sym] === 3 ? 0.75 : 1.0);
+      // ELV sizing 50% (historial negativo en backtest)
+      const elvMult = sym === 'ELV' ? 0.5 : 1.0;
+      const swingSizeMult = (sig.trendMultiplier || 0.75) * (RUNNER_TIER[sym] === 3 ? 0.75 : 1.0) * elvMult;
       const riskUSD = CAPITAL_EUR * RISK_PCT * 1.08 * swingSizeMult;
       const qty = capQty(Math.max(1, Math.floor(riskUSD / riskPerSh)), sig.last);
       const target1 = sig.MAH_1H || parseFloat((sig.last * 1.04).toFixed(2));
@@ -3290,8 +3355,8 @@ async function checkMOMSignals() {
       const sectorCount   = countSectorPositions(sym);
       if (sectorCount >= MAX_PER_SECTOR) continue;
 
-      const openCount     = Object.keys(openPositions).length;
-      if (openCount >= MAX_POSITIONS) continue;
+      // Slots por régimen (BULL: MOM≤3, LATERAL: MOM≤2, BEAR: MOM=0)
+      if (!canOpenPosition('MOM')) continue;
 
       if (!canReEnter(sym, sig.last)) continue;
 
@@ -3497,13 +3562,13 @@ async function checkSignals() {
     if (isORS) {
       // ORS solo entra si hay slots libres que MOM no va a ocupar
       // Máximo 1 ORS simultáneo
-      if (orsCount >= MAX_POSITIONS_ORS) {
-        console.log(`[SLOTS] ${cand.sym} ORS bloqueado — ya hay ${orsCount} ORS activo`);
+      // ORS: límite por régimen (BULL:1, LATERAL:2, BEAR:2)
+      var orsMax = getMaxBySystem('ORS');
+      if (orsCount >= orsMax) {
+        console.log(`[SLOTS] ${cand.sym} ORS bloqueado — ${orsCount}/${orsMax} (régimen:${MARKET_REGIME?.mode})`);
         continue;
       }
-      // ORS no compite con MOM — solo usa slots libres
-      // Si MOM puede llegar a MAX_POSITIONS_MOM, reservar esos slots
-      var momSlotsLibres = MAX_POSITIONS_MOM - momOpen;
+      var momSlotsLibres = getMaxBySystem('MOM') - momOpen;
       var totalLibres    = MAX_POSITIONS - totalOpen - selected.length;
       if (totalLibres <= momSlotsLibres) {
         console.log(`[SLOTS] ${cand.sym} ORS espera — slots reservados para MOM`);
@@ -4445,7 +4510,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.3',
+    version:       '3.49.5',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -6188,6 +6253,28 @@ app.get('/trades/stats', (req, res) => {
   });
 });
 
+// ── WATCHLIST STATUS — estado WATCH tickers para la app ──────────
+app.get('/watchlist/status', async (req, res) => {
+  try {
+    const active = getActiveWatchlist();
+    const watchStatus = WATCH_TICKERS.map(sym => ({
+      sym,
+      status: TICKER_STATUS[sym] || 'ACTIVE',
+      inDWL: DYNAMIC_WL_ADDITIONS.indexOf(sym) >= 0,
+      score: 0, // se actualiza en el scanner semanal
+    }));
+    res.json({
+      ts: new Date().toISOString(),
+      active: active.length,
+      watch: watchStatus,
+      dynamic: DYNAMIC_WL_ADDITIONS,
+      regime: MARKET_REGIME?.mode || 'BULL',
+      riskPct: Math.round(RISK_PCT * 100),
+      adaptiveDD: adaptiveDDActive,
+    });
+  } catch(e) { res.status(500).json({error: e.message}); }
+});
+
 // ── TRADES STATS POR ESTRATEGIA ─────────────────────────────────
 app.get('/trades/stats/strategy', (req, res) => {
   function ss(trades) {
@@ -6355,6 +6442,9 @@ app.listen(PORT, async () => {
 
   // SPY context update every 10 min
   setInterval(updateSPYContext, 10 * 60 * 1000);
+  // Drawdown adaptativo — verificar cada hora
+  setInterval(checkAdaptiveDrawdown, 60 * 60 * 1000);
+  setTimeout(checkAdaptiveDrawdown, 15000);
 
   // ── PYRAMIDING — segunda entrada cuando +3% ganancia ──
   // Level 1 + Pyramid: mismo riesgo base, aprovecha momentum
