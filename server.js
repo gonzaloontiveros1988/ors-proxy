@@ -482,6 +482,9 @@ function eightBarFilter(prices, atr) {
 // ── FIVE-BAR MAC PATTERN (Bernstein) ──────────────────────────────
 // 3+ velas consecutivas sobre MAH = breakout genuino (no spike falso)
 function fiveBarMACPattern(prices) {
+  return fiveBarMACPatternN(prices, 3);
+}
+function fiveBarMACPatternN(prices, minBars) {
   if (!prices || prices.length < 15) return true;
   const mac = calcMAC(prices);
   if (!mac) return true;
@@ -490,7 +493,7 @@ function fiveBarMACPattern(prices) {
     if ((prices[i].close||prices[i].c||0) > mac.MAH) count++;
     else break;
   }
-  return count >= 3;
+  return count >= (minBars || 3);
 }
 
 // ── VIX SPIKE DETECTOR ────────────────────────────────────────────
@@ -521,7 +524,35 @@ VIX: ${lastVIX.toFixed(1)} → ${currentVIX.toFixed(1)} (+${(change*100).toFixed
   lastVIX = currentVIX;
 }
 
-// ── SECTOR CRASH BLOCK ────────────────────────────────────────────
+// ── TICKERS NO DISPONIBLES EN ALPACA (cache dinámica) ────────────
+// Se rellena automáticamente cuando el asset check falla
+// Evita generar señales y enviar Telegram para tickers no tradables
+var ALPACA_UNAVAILABLE = {};  // sym → timestamp cuando se detectó
+
+function markUnavailable(sym) {
+  if (!ALPACA_UNAVAILABLE[sym]) {
+    console.log('[UNAVAILABLE] ' + sym + ' marcado como no disponible en Alpaca');
+  }
+  ALPACA_UNAVAILABLE[sym] = Date.now();
+}
+
+function isAvailableAlpaca(sym) {
+  var ts = ALPACA_UNAVAILABLE[sym];
+  if (!ts) return true;
+  // Re-verificar cada 24h por si el ticker vuelve a estar disponible
+  if (Date.now() - ts > 24*60*60*1000) {
+    delete ALPACA_UNAVAILABLE[sym];
+    return true;
+  }
+  return false;
+}
+
+// Tickers conocidos como no disponibles en Alpaca paper
+// (se añaden automáticamente cuando falla el asset check)
+var KNOWN_UNAVAILABLE = ['LUV', 'ZIM', 'SW'];
+KNOWN_UNAVAILABLE.forEach(function(sym) { markUnavailable(sym); });
+
+// ── SECTOR CRASH BLOCK ────────────────────────────────────────────────────────
 // Si ETF sector cae >4% hoy → no ORS en ese sector
 const SECTOR_FOR_TICKER = {
   NVDA:'AI_CHIPS',AMD:'AI_CHIPS',AVGO:'AI_CHIPS',TSM:'AI_CHIPS',
@@ -587,8 +618,10 @@ async function executeAlpacaOrder(sym, order) {
     if (!asset || asset.tradable === false || asset.status !== 'active') {
       const reason = !asset ? 'respuesta inválida' : (!asset.tradable ? 'not tradable' : `status:${asset.status}`);
       console.log(`[BLOCKED] ${sym}: ${reason}`);
-      await sendTelegram(`⚠️ <b>${sym}</b> no disponible en Alpaca (${reason}). Considera eliminarlo de la watchlist.`);
-      delete pendingOrders[sym]; return null;
+       markUnavailable(sym);
+       await sendTelegram(`⚠️ <b>${sym}</b> no disponible en Alpaca (${reason}).
+Bloqueado hasta mañana.`);
+       delete pendingOrders[sym]; return null;
     }
   } catch(e) { console.log(`[ASSET CHECK] ${sym}: ${e.message} — continuando`); }
 
@@ -2618,6 +2651,7 @@ async function pollTelegramCommands() {
         const sym = text.split(' ')[1]?.toUpperCase();
         if (sym && TICKER_STATUS[sym] === 'WATCH') {
           delete TICKER_STATUS[sym];
+          delete ALPACA_UNAVAILABLE[sym]; // limpiar cache Alpaca
           await sendTelegram(`✅ <b>${sym} → ACTIVE</b>
 El scanner generará señales normalmente.`);
         } else {
@@ -2640,6 +2674,21 @@ Sin señales auto. Scanner semanal lo monitoriza.`);
 ❌ DISCARDED: ${disc.join(', ')||'ninguno'}
 
 /reactivar TICKER | /pausar TICKER`);
+      }
+      else if (text === '/disponibilidad') {
+        var unavail = Object.keys(ALPACA_UNAVAILABLE);
+        if (!unavail.length) {
+          await sendTelegram('✅ Todos los tickers disponibles en Alpaca');
+        } else {
+          var unavailMsg = '⚠️ <b>Tickers no disponibles en Alpaca:</b>\n';
+          unavail.forEach(function(s) {
+            var hours = Math.round((Date.now()-ALPACA_UNAVAILABLE[s])/3600000);
+            unavailMsg += s + ' (detectado hace ' + hours + 'h)\n';
+          });
+          unavailMsg += '\nSe re-verifican cada 24h automáticamente.\n';
+          unavailMsg += 'Usa /reactivar TICKER para forzar re-verificación.';
+          await sendTelegram(unavailMsg);
+        }
       }
       else if (text === '/watchlist') {
         const active = getActiveWatchlist();
@@ -3083,6 +3132,7 @@ async function checkSwingSignals() {
   for (const sym of getActiveWatchlist()) {
     try {
       if (!isActive(sym)) continue;
+      if (!isAvailableAlpaca(sym)) continue;
       if (openPositions[sym]) continue;
 
       // Filtro mes
@@ -3287,16 +3337,22 @@ async function checkMOMSignals() {
       if (!momScoreOk(sym)) { console.log('[MomScore] '+sym+' bloqueado score:'+getMomScore(sym).toFixed(2)); continue; }
       if (MOM_BLACKLIST.indexOf(sym) >= 0 || serverBlacklist[sym]) continue;
 
+      // ── Verificar disponibilidad en Alpaca ──────────────────────
+      if (!isAvailableAlpaca(sym)) continue;
       // ── v13: Universo MOM separado — solo Tier1+Tier2 ───────────
       if (!canOperateMOM(sym)) {
         console.log(`[MOM-UNIVERSE] ${sym} no está en MOM_TICKERS — skip`);
         continue;
       }
 
-      // ── v13: Five-Bar MAC Pattern — 3+ barras sobre canal ────────
+      // ── v13: Five-Bar MAC Pattern — adaptativo por régimen ────────
+      // BULL fuerte: 3 barras (confirma breakout genuino)
+      // LATERAL/BEAR: 2 barras (mercado lateral, más señales necesarias)
       if (parsed.prices && parsed.prices.length >= 15) {
-        if (!fiveBarMACPattern(parsed.prices)) {
-          console.log(`[FIVE-BAR] ${sym} sin 3 barras sobre MAH — skip`);
+        const _regime = MARKET_REGIME?.mode || 'BULL';
+        const _fiveBarMin = (_regime === 'BULL') ? 3 : 2;
+        if (!fiveBarMACPatternN(parsed.prices, _fiveBarMin)) {
+          console.log(`[FIVE-BAR] ${sym} sin ${_fiveBarMin} barras sobre MAH (${_regime}) — skip`);
           continue;
         }
       }
@@ -4586,7 +4642,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.7',
+    version:       '3.49.9',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
