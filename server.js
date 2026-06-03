@@ -120,6 +120,12 @@ const TICKER_STATUS = {
   'ZIM':   'WATCH',  // shipping macro — vigilar ciclo global
   'SW':    'WATCH',  // sin datos suficientes — monitorizar
 };
+// ── ORS BLOCKED — tickers con WR 0% en ORS (≥3 trades, P&L negativo) ──
+// Se mantienen en MOM y SWING — solo bloqueados en ORS
+// Simulación v13b: +€2.282 P&L, -1.1% DD
+const ORS_BLOCKED_TICKERS = ['LUNR', 'MRVL', 'DAL', 'NVDA'];
+function isORSBlocked(sym) { return ORS_BLOCKED_TICKERS.indexOf(sym) >= 0; }
+
 // NOTA: ningún ticker se descarta permanentemente
 // WATCH = sin señales auto pero análisis semanal activo
 // Si score > umbral → pasa a DYNAMIC_WL_ADDITIONS automáticamente
@@ -979,13 +985,13 @@ async function manageTrailingStops() {
       if (!pos.dangerZoneDone && !pos.breakevenDone && barsHeldDZ >= 4 && barsHeldDZ <= 7) {
         const gainDZ = (price - pos.entryPrice) / pos.entryPrice * 100;
         if (gainDZ < 0.3) {
-          const halfRisk = pos.entryPrice - (pos.entryPrice - pos.originalStop) * 0.50;
+          const halfRisk = pos.entryPrice - (pos.entryPrice - pos.originalStop) * 0.35; // v13b: DZ35%
           const newStop  = parseFloat(halfRisk.toFixed(2));
           if (newStop > pos.stopPrice) {
             pos.stopPrice      = newStop;
             pos.dangerZoneDone = true;
             openPositions[sym] = pos;
-            console.log(`[DANGER ZONE] ${sym} stop ajustado a $${newStop} (50% riesgo)`);
+            console.log(`[DANGER ZONE] ${sym} stop ajustado a $${newStop} (35% riesgo v13b)`);
           }
         } else {
           pos.dangerZoneDone = true;
@@ -3627,7 +3633,11 @@ async function checkSignals() {
 
     if (isORS) {
       // ORS solo entra si hay slots libres que MOM no va a ocupar
-      // Máximo 1 ORS simultáneo
+      // Tickers bloqueados en ORS (WR 0% histórico ≥3 trades)
+      if (isORSBlocked(cand.sym)) {
+        console.log('[ORS-BLOCKED] ' + cand.sym + ' bloqueado en ORS — solo MOM/SWING');
+        continue;
+      }
       // ORS: límite por régimen (BULL:1, LATERAL:2, BEAR:2)
       var orsMax = getMaxBySystem('ORS');
       if (orsCount >= orsMax) {
@@ -4576,7 +4586,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.6',
+    version:       '3.49.7',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
