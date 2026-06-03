@@ -3200,7 +3200,8 @@ async function checkSwingSignals() {
 
       if (AUTO_EXECUTE) {
         pendingOrders[sym] = order;
-        await executeAlpacaOrder(sym, order);
+        const _execSW = await executeAlpacaOrder(sym, order);
+        if (_execSW === null) { delete pendingOrders[sym]; continue; }
         await sendTelegram(
           `📈 <b>SWING SIGNAL — ${sym}</b>\n` +
           `💰 $${sig.last.toFixed(2)} | Stop $${swingStop} | Target $${target1}\n` +
@@ -3521,7 +3522,12 @@ async function checkMOMSignals() {
           aboveSMA200:sig.aboveSMA200,
           type:'MOM', ts:now,
         };
-        await executeAlpacaOrder(sym, pendingOrders[sym]);
+        const _execResult = await executeAlpacaOrder(sym, pendingOrders[sym]);
+        if (_execResult === null) {
+          // Asset check falló — ticker no disponible en Alpaca
+          // No mandar Telegram — markUnavailable ya llamado en executeAlpacaOrder
+          delete pendingOrders[sym]; continue;
+        }
         await sendTelegram(
           `🚀 <b>MOM SIGNAL — ${sym}</b>\n` +
           `💰 $${sig.last.toFixed(2)} | Stop $${_stop} | Target $${_target}\n` +
@@ -3783,7 +3789,8 @@ async function checkSignals() {
           orsScore:sig.orsScore, condsMet:sig.condsMet,
           is4of5:is4of5OBV, ts:now, score:cand.score,
         };
-        await executeAlpacaOrder(sym, pendingOrders[sym]);
+        const _execORS = await executeAlpacaOrder(sym, pendingOrders[sym]);
+        if (_execORS === null) { delete pendingOrders[sym]; continue; }
 
         const qualLabel = is5of5 ? '⚡ ÓPTIMA 5/5' : '✅ SEÑAL 4/5+OBV';
         const spyLabel  = spyMult < 1 ? ` · SPY ${spyContext.trend} ×${spyMult}` : '';
@@ -4642,7 +4649,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.9',
+    version:       '3.50.0',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
