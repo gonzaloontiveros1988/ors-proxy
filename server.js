@@ -548,9 +548,13 @@ function isAvailableAlpaca(sym) {
 }
 
 // Tickers conocidos como no disponibles en Alpaca paper
-// (se añaden automáticamente cuando falla el asset check)
+// SOLO los confirmados manualmente — NO marcar automáticamente
+// LUV, ZIM, SW: confirmados no tradables en paper2
 var KNOWN_UNAVAILABLE = ['LUV', 'ZIM', 'SW'];
 KNOWN_UNAVAILABLE.forEach(function(sym) { markUnavailable(sym); });
+
+// IMPORTANTE: TSM, ROK, HUM, NVDA y todos los del SP500 SÍ son tradables
+// El asset check pre-vuelo fue eliminado por generar falsos positivos
 
 // ── SECTOR CRASH BLOCK ────────────────────────────────────────────────────────
 // Si ETF sector cae >4% hoy → no ORS en ese sector
@@ -610,20 +614,7 @@ async function executeAlpacaOrder(sym, order) {
     return null;
   }
 
-  // ── VERIFICAR ASSET TRADABLE EN ALPACA ───────────────────────────
-  try {
-    const ar = await fetch(`${alpacaBase()}/v2/assets/${sym}`, { headers: alpacaHeaders() });
-    const at = await ar.text();
-    let asset; try { asset = JSON.parse(at); } catch(e) { asset = null; }
-    if (!asset || asset.tradable === false || asset.status !== 'active') {
-      const reason = !asset ? 'respuesta inválida' : (!asset.tradable ? 'not tradable' : `status:${asset.status}`);
-      console.log(`[BLOCKED] ${sym}: ${reason}`);
-       markUnavailable(sym);
-       await sendTelegram(`⚠️ <b>${sym}</b> no disponible en Alpaca (${reason}).
-Bloqueado hasta mañana.`);
-       delete pendingOrders[sym]; return null;
-    }
-  } catch(e) { console.log(`[ASSET CHECK] ${sym}: ${e.message} — continuando`); }
+  
 
   const acc = getAcc();
   const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
@@ -4649,7 +4640,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.50.0',
+    version:       '3.50.1',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
