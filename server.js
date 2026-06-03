@@ -4675,7 +4675,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.50.3',
+    version:       '3.50.4',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -6415,6 +6415,79 @@ app.get('/trades/stats', (req, res) => {
     byExitReason: byReason,
     best:   sorted[0]  || null,
     worst:  sorted[sorted.length-1] || null,
+  });
+});
+
+// ── SEASONAL ANALYSIS ENDPOINT ───────────────────────────────────
+// Descarga datos históricos reales de Alpaca y calcula estacionalidad
+// Llamar una vez: GET /seasonal/analyze
+// Devuelve retorno medio mensual real por ticker (últimos 8 años)
+app.get('/seasonal/analyze', async (req, res) => {
+  const tickers = [
+    'DAL','AAL','UAL','HUM','HCA','ISRG','FDX','ROK','GD',
+    'MU','TSM','AVGO','ORCL','MDB','ABBV','EL','BE','CEG',
+    'CRSP','INSM','AMG','NVDA','META','GOOGL','AMZN','TSLA',
+    'RKLB','LUNR','CRWV','DDOG','SNOW','NOW','SMCI','TKO',
+    'MRVL','QCOM','HUT','ABBV','GEV','SATS',
+    // Candidatos SP500
+    'MSFT','ANET','APP','AXON','UBER','SHOP','ADBE','CRM',
+    'PANW','PYPL','PLTR','DECK','LRCX','META'
+  ].filter((v,i,a) => a.indexOf(v) === i);
+
+  const results = {};
+  const errors  = [];
+
+  for (const sym of tickers) {
+    try {
+      const start = new Date();
+      start.setFullYear(start.getFullYear() - 8);
+      const startStr = start.toISOString().slice(0,10);
+      const endStr   = new Date().toISOString().slice(0,10);
+
+      const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Month&start=${startStr}&end=${endStr}&limit=120&feed=iex&sort=asc`;
+      const r   = await fetch(url, { headers: alpacaHeaders() });
+      const d   = await r.json();
+      const bars = d.bars || [];
+
+      if (bars.length < 12) { errors.push(`${sym}: solo ${bars.length} meses`); continue; }
+
+      // Calcular retorno mensual por mes del año
+      const byMonth = {};
+      for (let m = 1; m <= 12; m++) byMonth[m] = [];
+
+      bars.forEach(b => {
+        const month = parseInt(b.t.slice(5,7));
+        const ret   = (b.c - b.o) / b.o * 100;
+        byMonth[month].push(parseFloat(ret.toFixed(2)));
+      });
+
+      const seasonal = {};
+      for (let m = 1; m <= 12; m++) {
+        const vals = byMonth[m];
+        if (!vals.length) continue;
+        const avg  = vals.reduce((s,v) => s+v, 0) / vals.length;
+        const bull = vals.filter(v => v > 0).length;
+        seasonal[m] = {
+          avg:   parseFloat(avg.toFixed(2)),
+          bull:  Math.round(bull/vals.length*100),
+          n:     vals.length,
+          vals:  vals,
+        };
+      }
+
+      results[sym] = { seasonal, bars: bars.length, from: bars[0]?.t?.slice(0,7) };
+      console.log(`[SEASONAL] ${sym}: ${bars.length} meses OK`);
+      await new Promise(r => setTimeout(r, 200)); // rate limit
+    } catch(e) {
+      errors.push(`${sym}: ${e.message}`);
+    }
+  }
+
+  res.json({
+    generated: new Date().toISOString(),
+    tickers:   Object.keys(results).length,
+    errors,
+    data: results
   });
 });
 
