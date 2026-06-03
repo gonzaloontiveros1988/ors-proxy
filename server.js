@@ -379,6 +379,7 @@ function fiveBarMACPattern(prices) {
 // ── VIX SPIKE DETECTOR ────────────────────────────────────────────
 // Si VIX sube >30% en 24h → pausa entradas nuevas
 let lastVIX = null;
+let latestVIX = null;
 let vixSpikeActive = false;
 let vixSpikeUntil  = null;
 function updateVIXSpike(currentVIX) {
@@ -773,7 +774,7 @@ async function manageTrailingStops() {
     try {
       const pos = openPositions[sym];
       if(!pos) continue;
-      const isMOM = pos.type === 'MOM';
+      const isMOM = pos.system === 'MOM' || pos.type === 'MOM'; // compatibilidad
 
       // Precio actual
       const sr = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${sym}&feed=iex`,{headers:alpacaHeaders()});
@@ -1932,7 +1933,7 @@ function calcORSSignal(prices, quote) {
   // ── ORS-v2 CORE CONDITIONS (5) ──
   // FIX: RSI máx 38 — más recorrido garantizado
   const rsiOk    = rsi >= 20 && rsi <= 38;
-  const rsiCruz  = rsiPrev !== null && rsiPrev < 30 && rsi >= 30;
+  const rsiCruz  = rsiPrev !== null && rsiPrev < 35 && rsi >= 28; // v13: zona ampliada
   const bajoVwap = ema20 && last < ema20;
   const obvOk    = obv && obv.bullish && obv.rising;  // MANDATORY
   const macdBull = macd && macd.bullish;
@@ -1945,7 +1946,7 @@ function calcORSSignal(prices, quote) {
     const recent   = prices.slice(-lookback);
     const maxPrice = recent.reduce((m,p)=>Math.max(m,p.high||p.close),-Infinity);
     const dropPct  = (last - maxPrice) / maxPrice * 100;
-    depthOk = dropPct <= -4;
+    depthOk = dropPct <= -2.5; // v13: -2.5% (antes -4% demasiado estricto)
   }
 
   // Ichimoku como contexto de scoring
@@ -1955,7 +1956,7 @@ function calcORSSignal(prices, quote) {
   const condsMet = [rsiOk, rsiCruz, bajoVwap, macdBull].filter(Boolean).length + (obvOk ? 1 : 0);
   // Solo aceptar ORS 5/5 — las 5 condiciones obligatorias
   // 4/5 desactivado hasta tener mayor capital (julio revisión)
-  const validORS = condsMet >= 5 && obvOk && depthOk;
+  const validORS = condsMet >= 4 && obvOk && depthOk; // v13: mínimo 4/5
 
   // ── ENHANCED SCORE with Ichimoku/Turtle/Fibonacci/SMA200 ──
   let orsScore = 0;
@@ -2013,7 +2014,7 @@ function calcORSSignal(prices, quote) {
     const atrMinPct = 0.005; // 0.5% mínimo
     const atrAdjusted = atrPct < atrMinPct ? last * atrMinPct : atr;
 
-    stopPrice = parseFloat((last - atrAdjusted * 2.0).toFixed(2));
+    stopPrice = parseFloat((last - atrAdjusted * 1.5).toFixed(2)); // v13: ATR×1.5
     const riskUSD  = CAPITAL_EUR * RISK_PCT * 1.08;
     const qualMult = condsMet >= 5 ? 1.0 : 0.5;
     // Sizing con Ichimoku — si pasa el filtro más exigente merece más capital
@@ -2298,7 +2299,7 @@ async function pollTelegramCommands() {
       else if (text === '/señales' || text === '/scan') {
         await sendTelegram('🔍 Escaneando watchlist ahora...');
         await checkSignals();
-        await sendTelegram(`✅ Scan completado · ${WATCHLIST.length} tickers revisados`);
+        await sendTelegram(`✅ Scan completado · ${getActiveWatchlist().length} tickers revisados`);
       }
 
       // /cerrar_SYM → close position
@@ -2398,7 +2399,7 @@ async function pollTelegramCommands() {
         msg += `💳 Cuenta activa: ${activeAcc.id}\n`;
         msg += `🏦 IBKR: ${ping ? '✅ Conectado' : '❌ Desconectado'}\n`;
         msg += `💼 Modo: ${USE_PAPER ? 'Paper Trading' : '🔴 Cuenta Real'}\n`;
-        msg += `👁 Watchlist: ${WATCHLIST.join(', ')}\n`;
+        msg += `👁 Watchlist: ${getActiveWatchlist().slice(0,20).join(', ')}...\n`;
         msg += `⏰ ${new Date().toLocaleString('es-ES', {timeZone: 'America/New_York'})} NY\n`;
         msg += `📋 Órdenes pendientes: ${Object.keys(pendingOrders).length}\n`;
         msg += `🔄 Datos: ${alpacaOk ? 'Alpaca 15min RT' : 'Yahoo Finance (retraso)'}`;
@@ -2806,7 +2807,7 @@ async function checkMOMSignals() {
   const rsiMax     = bearMode ? 70 : 68;   // no entrar en sobrecompra extrema
   const minScore   = bearMode ? 85 : lateralMode ? 75 : 0; // score mínimo ORS en bajista
 
-  console.log(`[MOM] Modo ${regime.mode} | RSI ${rsiMin}-${rsiMax} | MinScore=${minScore} | Size=${spyMult}x | Tickers=${WATCHLIST.length}`);
+  console.log(`[MOM] Modo ${regime.mode} | RSI ${rsiMin}-${rsiMax} | MinScore=${minScore} | Size=${spyMult}x | Tickers=${getActiveWatchlist().length}`);
   const now     = Date.now();
 
   for (const sym of getActiveWatchlist()) {
@@ -2854,6 +2855,20 @@ async function checkMOMSignals() {
       // MomScore: bloquear tickers sin momentum real
       if (!momScoreOk(sym)) { console.log('[MomScore] '+sym+' bloqueado score:'+getMomScore(sym).toFixed(2)); continue; }
       if (MOM_BLACKLIST.indexOf(sym) >= 0 || serverBlacklist[sym]) continue;
+
+      // ── v13: Universo MOM separado — solo Tier1+Tier2 ───────────
+      if (!canOperateMOM(sym)) {
+        console.log(`[MOM-UNIVERSE] ${sym} no está en MOM_TICKERS — skip`);
+        continue;
+      }
+
+      // ── v13: Five-Bar MAC Pattern — 3+ barras sobre canal ────────
+      if (parsed.prices && parsed.prices.length >= 15) {
+        if (!fiveBarMACPattern(parsed.prices)) {
+          console.log(`[FIVE-BAR] ${sym} sin 3 barras sobre MAH — skip`);
+          continue;
+        }
+      }
 
       // ── Filtro de Fuerza Relativa en modo BEAR ────────────────────────────
       // En mercado bajista solo operamos tickers que superan al SPY últimos 5 días
@@ -3074,7 +3089,7 @@ async function checkSignals() {
   const regimeSizeMult = regime.sizeMult;
   const bearMode = regime.mode === 'BEAR';
 
-  console.log(`[ORS] Modo ${regime.mode} | ORS-Priority=${orsIsPriority} | SizeMult=${regimeSizeMult}x | Tickers=${WATCHLIST.length}`);
+  console.log(`[ORS] Modo ${regime.mode} | ORS-Priority=${orsIsPriority} | SizeMult=${regimeSizeMult}x | Tickers=${getActiveWatchlist().length}`);
 
   // ── SPY CONTEXT — actualizar cada 15min ──────────────
   if (!spyContext.ts || Date.now() - spyContext.ts > 15 * 60 * 1000) {
@@ -3082,7 +3097,7 @@ async function checkSignals() {
   }
   const spyMult = getSPYSizingMultiplier();
 
-  console.log(`[${new Date().toISOString()}] Scan ${WATCHLIST.length} tickers | SPY:${spyContext.trend}(${spyContext.change}%) | NoEntry:${noEntry}`);
+  console.log(`[${new Date().toISOString()}] Scan ${getActiveWatchlist().length} tickers | SPY:${spyContext.trend}(${spyContext.change}%) | NoEntry:${noEntry}`);
 
   const now = Date.now();
   const candidateSignals = []; // Acumula señales para rankear
@@ -3395,8 +3410,8 @@ app.get('/check', async (req, res) => {
     ok: true,
     account: acc.label,
     capital: CAPITAL_EUR,
-    watchlist: WATCHLIST,
-    watchlistCount: WATCHLIST.length,
+    watchlist: getActiveWatchlist(),
+    watchlistCount: getActiveWatchlist().length,
     vix:           vixContext.value,
     orsSlots:      countORSPositions()+'/'+MAX_POSITIONS_ORS,
     momSlots:      countMOMPositions()+'/'+MAX_POSITIONS_MOM,
@@ -3432,7 +3447,7 @@ app.get('/', async (req, res) => {
     ibkr:     ping ? 'connected' : 'disconnected',
     mode:     USE_PAPER ? 'paper' : 'live',
     account:  USE_PAPER ? IBKR_PAPER : IBKR_ACCOUNT,
-    watchlist: WATCHLIST,
+    watchlist: getActiveWatchlist(),
     pending:  Object.keys(pendingOrders).length,
     time:     new Date().toISOString()
   });
@@ -4136,7 +4151,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.1',
+    version:       '3.49.2',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
@@ -5065,7 +5080,7 @@ app.get('/test/ors', async (req, res) => {
     const days      = parseInt(req.query.days) || 60;
     const startDate = req.query.startDate || null;
     const endDate   = req.query.endDate   || null;
-    const tickers   = req.query.tickers ? req.query.tickers.split(',') : WATCHLIST;
+    const tickers   = req.query.tickers ? req.query.tickers.split(',') : getActiveWatchlist();
 
     let result;
     if (startDate && endDate) {
@@ -5155,7 +5170,7 @@ app.get('/test/both', async (req, res) => {
     const days      = parseInt(req.query.days) || 30;
     const startDate = req.query.startDate || null;
     const endDate   = req.query.endDate   || null;
-    const tickers   = req.query.tickers ? req.query.tickers.split(',') : WATCHLIST;
+    const tickers   = req.query.tickers ? req.query.tickers.split(',') : getActiveWatchlist();
     const daysCalc  = startDate && endDate
       ? Math.ceil((new Date(endDate)-new Date(startDate))/86400000)+5
       : days;
@@ -5246,7 +5261,7 @@ app.get('/backtest/regime', async (req, res) => {
     }
 
     // Tickers para cada escenario
-    const tickersCurrent = WATCHLIST.slice(0, 163); // watchlist original
+    const tickersCurrent = getActiveWatchlist();
     const tickersSP500   = SP500_FULL;               // SP500 completo
 
     // ── Ejecutar los 3 escenarios en paralelo ────────────────────────────────
@@ -5913,7 +5928,7 @@ app.listen(PORT, async () => {
   await sendTelegram(
     `🚀 <b>ORS Proxy arrancado</b>\n\n` +
     `💼 Modo: ${USE_PAPER ? 'Paper Trading ✅' : '🔴 Cuenta Real'}\n` +
-    `👁 Watchlist: ${WATCHLIST.join(', ')}\n` +
+    `👁 Watchlist activa: ${getActiveWatchlist().length} tickers\n` +
     `📡 Señales: cada 5 minutos\n\n` +
     `Escribe /ayuda para ver los comandos`
   );
@@ -6016,7 +6031,18 @@ app.listen(PORT, async () => {
     const nyH = parseInt(new Date().toLocaleString('en-US',{timeZone:'America/New_York',hour:'numeric',hour12:false}));
     if(nyH>=9&&nyH<16) {
       // Actualizar VIX spike detector con dato actual
-    if (typeof latestVIX !== 'undefined') updateVIXSpike(latestVIX);
+    try {
+      const _vixSnap = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=3d`,
+        {headers:{'User-Agent':'Mozilla/5.0'}});
+      const _vixData = await _vixSnap.json();
+      const _vixClose = _vixData?.chart?.result?.[0]?.indicators?.quote?.[0]?.close;
+      if (_vixClose && _vixClose.length >= 2) {
+        const _vixNow  = _vixClose[_vixClose.length-1];
+        const _vixYest = _vixClose[_vixClose.length-2];
+        if (_vixNow) updateVIXSpike(_vixNow);
+        latestVIX = _vixNow;
+      }
+    } catch(e) { /* VIX check silencioso */ }
     await manageTrailingStops();
       await checkAggressiveBreakeven(); // Breakeven agresivo a +1.5%
     }
