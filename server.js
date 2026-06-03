@@ -553,8 +553,27 @@ function isAvailableAlpaca(sym) {
 var KNOWN_UNAVAILABLE = ['LUV', 'ZIM', 'SW'];
 KNOWN_UNAVAILABLE.forEach(function(sym) { markUnavailable(sym); });
 
-// IMPORTANTE: TSM, ROK, HUM, NVDA y todos los del SP500 SÍ son tradables
-// El asset check pre-vuelo fue eliminado por generar falsos positivos
+// Limpiar cualquier ticker bloqueado incorrectamente por errores temporales
+// Se ejecuta al arrancar para resetear la cache
+var ALWAYS_AVAILABLE = [
+  'TSM','NVDA','AMD','AVGO','MU','MRVL','QCOM','SMCI',
+  'ORCL','META','AMZN','GOOGL','MDB','CRWV','NOW','DDOG','SNOW',
+  'CEG','GEV','BE','TSLA','RKLB','LUNR','SATS',
+  'DAL','UAL','AAL','HCA','ISRG',
+  'INSM','CRSP','ABBV','HUT','TKO',
+  'ROK','ITW','FDX','GD','AMG','EL','HUM','ELV','CI',
+  'PWR','GOOGL','QCOM',
+];
+ALWAYS_AVAILABLE.forEach(function(sym) {
+  if (ALPACA_UNAVAILABLE[sym]) {
+    delete ALPACA_UNAVAILABLE[sym];
+    console.log('[STARTUP] ' + sym + ' desbloqueado — era error temporal');
+  }
+});
+
+// IMPORTANTE: La cache ALPACA_UNAVAILABLE solo se usa para LUV/ZIM/SW
+// confirmados manualmente. Nunca se añaden automáticamente.
+// Los errores temporales de Alpaca (rate limit, timeout) NO bloquean tickers.
 
 // ── SECTOR CRASH BLOCK ────────────────────────────────────────────────────────
 // Si ETF sector cae >4% hoy → no ORS en ese sector
@@ -630,17 +649,32 @@ async function executeAlpacaOrder(sym, order) {
     });
     // Manejar respuestas no-JSON (ej: ticker no disponible en Alpaca)
     let buyOrder;
+    let buyText = '';
     try {
-      const buyText = await buyResp.text();
+      buyText = await buyResp.text();
+      // Detectar rate limit (429) o error HTML antes de parsear
+      if (buyResp.status === 429) {
+        console.log(`[EXEC] ${sym}: Rate limit Alpaca (429) — esperando 3s y reintentando`);
+        await new Promise(r => setTimeout(r, 3000));
+        const buyResp2 = await fetch(`${alpacaBase()}/v2/orders`, {
+          method: 'POST', headers: alpacaHeaders(),
+          body: JSON.stringify({ symbol: sym, qty: String(qty1), side: 'buy', type: 'market', time_in_force: 'day' }),
+        });
+        buyText = await buyResp2.text();
+      }
       buyOrder = JSON.parse(buyText);
     } catch(e) {
-      await sendTelegram(`❌ Error Alpaca ${sym}: respuesta no válida (ticker no disponible en paper trading)`);
-      console.log(`[EXEC] ${sym}: respuesta no-JSON de Alpaca — ticker posiblemente no disponible`);
-      return;
+      console.log(`[EXEC] ${sym}: respuesta no-JSON (status ${buyResp.status}) — ${buyText.slice(0,200)}`);
+      // NO marcar como unavailable — puede ser error temporal de red
+      // Reintentar en el próximo ciclo de 5min
+      await sendTelegram(`⚠️ Alpaca no respondió correctamente para ${sym} (status ${buyResp.status}). Se reintentará en el próximo ciclo.`);
+      return null;
     }
     if (!buyOrder.id) {
-      await sendTelegram(`❌ Error Alpaca ${sym}: ${buyOrder.message || JSON.stringify(buyOrder).slice(0,100)}`);
-      return;
+      const errMsg = buyOrder.message || buyOrder.code || JSON.stringify(buyOrder).slice(0, 150);
+      console.log(`[EXEC] ${sym}: Alpaca rechazó la orden — ${errMsg}`);
+      await sendTelegram(`❌ Error Alpaca ${sym}: ${errMsg}`);
+      return null;
     }
 
     // 2. Stop loss GTC
@@ -705,6 +739,7 @@ async function executeAlpacaOrder(sym, order) {
   } catch(e) {
     console.error('executeAlpacaOrder error:', e.message);
     await sendTelegram(`❌ Error ejecutando ${sym}: ${e.message}`);
+    return null;
   }
 }
 
@@ -3192,7 +3227,7 @@ async function checkSwingSignals() {
       if (AUTO_EXECUTE) {
         pendingOrders[sym] = order;
         const _execSW = await executeAlpacaOrder(sym, order);
-        if (_execSW === null) { delete pendingOrders[sym]; continue; }
+        if (_execSW == null) { delete pendingOrders[sym]; continue; }
         await sendTelegram(
           `📈 <b>SWING SIGNAL — ${sym}</b>\n` +
           `💰 $${sig.last.toFixed(2)} | Stop $${swingStop} | Target $${target1}\n` +
@@ -3514,7 +3549,7 @@ async function checkMOMSignals() {
           type:'MOM', ts:now,
         };
         const _execResult = await executeAlpacaOrder(sym, pendingOrders[sym]);
-        if (_execResult === null) {
+        if (_execResult == null) {
           // Asset check falló — ticker no disponible en Alpaca
           // No mandar Telegram — markUnavailable ya llamado en executeAlpacaOrder
           delete pendingOrders[sym]; continue;
@@ -3781,7 +3816,7 @@ async function checkSignals() {
           is4of5:is4of5OBV, ts:now, score:cand.score,
         };
         const _execORS = await executeAlpacaOrder(sym, pendingOrders[sym]);
-        if (_execORS === null) { delete pendingOrders[sym]; continue; }
+        if (_execORS == null) { delete pendingOrders[sym]; continue; }
 
         const qualLabel = is5of5 ? '⚡ ÓPTIMA 5/5' : '✅ SEÑAL 4/5+OBV';
         const spyLabel  = spyMult < 1 ? ` · SPY ${spyContext.trend} ×${spyMult}` : '';
@@ -4640,7 +4675,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.50.1',
+    version:       '3.50.3',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
