@@ -149,46 +149,93 @@ const IBKR_PAPER    = process.env.IBKR_PAPER    || 'DU24668151';
 const IBKR_BASE     = process.env.IBKR_BASE     || 'https://api.ibkr.com/v1/api';
 let CAPITAL_EUR   = parseFloat(process.env.CAPITAL_EUR || '11480');
 const RISK_PCT_BASE = parseFloat(process.env.RISK_PCT || '0.02'); // 2% base
-let   RISK_PCT      = RISK_PCT_BASE; // puede reducirse a 1% por drawdown adaptativo
+let   RISK_PCT      = RISK_PCT_BASE; // ajustado dinámicamente
 let   adaptiveDDActive = false;
 
-// ── DRAWDOWN ADAPTATIVO ────────────────────────────────────────────
-// Si pérdida mensual >5% del capital → bajar riesgo a 1% automáticamente
-// Cuando recupera el nivel inicial del mes → volver a 2%
-let monthStartCapital = null;
-async function checkAdaptiveDrawdown() {
+// ── RIESGO DINÁMICO (Hoja de ruta julio 2026) ─────────────────────
+// false = 2% fijo (Nivel 1 paper — evaluación limpia)
+// true  = 1/2/3% dinámico (Nivel 2 real en adelante)
+const DYNAMIC_RISK_ENABLED = process.env.DYNAMIC_RISK === 'true';
+
+// Historial WR últimos N trades para el trigger del 3%
+const RECENT_TRADES_WINDOW = 10;
+let   recentTradesHistory  = []; // {win: bool, ts: Date}
+
+function updateRecentTrades(win) {
+  recentTradesHistory.push({ win, ts: Date.now() });
+  if (recentTradesHistory.length > RECENT_TRADES_WINDOW * 2) {
+    recentTradesHistory = recentTradesHistory.slice(-RECENT_TRADES_WINDOW * 2);
+  }
+}
+
+function getRecentWR() {
+  const last = recentTradesHistory.slice(-RECENT_TRADES_WINDOW);
+  if (last.length < 5) return 50; // sin suficientes datos → neutro
+  return last.filter(t => t.win).length / last.length * 100;
+}
+
+async function updateDynamicRisk() {
+  if (!DYNAMIC_RISK_ENABLED) {
+    RISK_PCT = RISK_PCT_BASE; // siempre 2% en Nivel 1
+    return;
+  }
+
   try {
-    const r = await fetch(`${alpacaBase()}/v2/account`, {headers: alpacaHeaders()});
+    // Calcular DD mensual real desde Alpaca
+    const r   = await fetch(`\${alpacaBase()}/v2/account`, { headers: alpacaHeaders() });
     const acc = await r.json();
-    const currentCapital = parseFloat(acc.equity || acc.portfolio_value || 0) / 1.08;
-    if (!monthStartCapital) {
-      monthStartCapital = currentCapital;
-      return;
-    }
-    const monthDD = (monthStartCapital - currentCapital) / monthStartCapital * 100;
-    if (monthDD >= 5 && !adaptiveDDActive) {
-      adaptiveDDActive = true;
+    const currentCap = parseFloat(acc.equity || acc.portfolio_value || 0) / 1.08;
+
+    if (!monthStartCapital) { monthStartCapital = currentCap; }
+    const monthDD  = (monthStartCapital - currentCap) / monthStartCapital * 100;
+    const recentWR = getRecentWR();
+    const regime   = MARKET_REGIME?.mode || 'BULL';
+
+    const prevRisk = RISK_PCT;
+
+    if (monthDD >= 5) {
+      // Pérdida mensual > 5% → proteger capital
       RISK_PCT = RISK_PCT_BASE * 0.5; // 1%
-      console.log(`[DD ADAPTATIVO] Activado — DD mensual ${monthDD.toFixed(1)}% → RISK reducido a ${(RISK_PCT*100).toFixed(0)}%`);
-      await sendTelegram(
-        `⚠️ <b>DRAWDOWN ADAPTATIVO ACTIVADO</b>\n` +
-        `DD mensual: -${monthDD.toFixed(1)}% (límite 5%)\n` +
-        `Riesgo por trade: 2% → 1%\n` +
-        `Se restaura cuando recupere el capital del mes.`
-      );
-    } else if (adaptiveDDActive && currentCapital >= monthStartCapital * 0.99) {
+      adaptiveDDActive = true;
+    } else if (regime === 'BULL' && recentWR >= 60 && monthDD < 2) {
+      // Condiciones óptimas → ampliar
+      RISK_PCT = RISK_PCT_BASE * 1.5; // 3%
       adaptiveDDActive = false;
+    } else {
+      // Normal
       RISK_PCT = RISK_PCT_BASE; // 2%
-      console.log(`[DD ADAPTATIVO] Desactivado — capital recuperado`);
-      await sendTelegram(
-        `✅ <b>Riesgo restaurado al 2%</b>\n` +
-        `Capital recuperado — DD mensual normalizado.`
-      );
+      adaptiveDDActive = false;
     }
+
     // Reset capital inicio de mes
     const dayOfMonth = new Date().getUTCDate();
-    if (dayOfMonth === 1) monthStartCapital = currentCapital;
-  } catch(e) { console.log('[DD ADAPTATIVO]', e.message); }
+    if (dayOfMonth === 1) monthStartCapital = currentCap;
+
+    // Alertar solo si cambia el nivel
+    if (prevRisk !== RISK_PCT) {
+      const emoji = RISK_PCT > prevRisk ? '📈' : '📉';
+      const label = RISK_PCT === RISK_PCT_BASE * 1.5 ? '3% 🔥 BULL óptimo'
+                  : RISK_PCT === RISK_PCT_BASE       ? '2% ✅ Normal'
+                  : '1% ⚠️ DD protección';
+      console.log(`[DYNAMIC RISK] \${(prevRisk*100).toFixed(0)}% → \${(RISK_PCT*100).toFixed(0)}% | DD:\${monthDD.toFixed(1)}% WR10:\${recentWR.toFixed(0)}% Régimen:\${regime}`);
+      await sendTelegram(
+        `\${emoji} <b>Riesgo ajustado → \${label}</b>\n` +
+        `DD mensual: \${monthDD.toFixed(1)}% | WR últimos 10: \${recentWR.toFixed(0)}%\n` +
+        `Régimen: \${regime} | Capital: €\${Math.round(currentCap).toLocaleString('es-ES')}`
+      );
+    }
+  } catch(e) {
+    console.log('[DYNAMIC RISK]', e.message);
+  }
+}
+
+// ── DRAWDOWN ADAPTATIVO / RIESGO DINÁMICO ───────────────────────
+// Función unificada — reemplaza checkAdaptiveDrawdown
+// En Nivel 1 (DYNAMIC_RISK=false): solo protección 1% si DD>5%
+// En Nivel 2+ (DYNAMIC_RISK=true): sistema completo 1/2/3%
+let monthStartCapital = null;
+async function checkAdaptiveDrawdown() {
+  await updateDynamicRisk();
 }
 const USE_PAPER     = process.env.USE_PAPER !== 'false';
 
@@ -970,6 +1017,7 @@ ${pos.qty1} acc @ $${price.toFixed(2)} · +€${pnl}
             headers:{...alpacaHeaders(),'Content-Type':'application/json'},
             body: JSON.stringify({ symbol:sym, qty:String(pos.qty2), side:'sell', type:'market', time_in_force:'day' }) });
           const pnl = Math.round((price-pos.entryPrice)*pos.qty2/1.08);
+          updateRecentTrades(true); // registrar ganancia para WR dinámico
           await sendTelegram(`✅ <b>PT2 — ${sym}</b>
 ${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
 🏁 Posición completa`);
@@ -2607,19 +2655,37 @@ Sin señales auto. Scanner semanal lo monitoriza.`);
 Scanner semanal: ${active.length + watch.length} tickers`;
         await sendTelegram(msg);
       }
+      else if (text === '/riesgo') {
+        const recentWR = getRecentWR();
+        const enabled = DYNAMIC_RISK_ENABLED;
+        const regime  = MARKET_REGIME?.mode || 'BULL';
+        const riskPct = Math.round(RISK_PCT * 100);
+        const mdd = monthStartCapital
+          ? ((monthStartCapital - parseFloat((await fetch(`${alpacaBase()}/v2/account`,{headers:alpacaHeaders()}).then(r=>r.json()).catch(()=>({equity:0}))).equity||0)/1.08) / monthStartCapital * 100).toFixed(1)
+          : '—';
+        await sendTelegram(
+          `📊 <b>Estado del Riesgo</b>\n\n` +
+          `Modo: ${enabled ? '🔥 DINÁMICO (1/2/3%)' : '📋 FIJO (2%)'}\n` +
+          `Riesgo actual: <b>${riskPct}%</b>\n` +
+          `Régimen: ${regime}\n` +
+          `DD mensual: ${mdd}%\n` +
+          `WR últimos 10: ${recentWR.toFixed(0)}%\n` +
+          `DD adaptativo: ${adaptiveDDActive ? '⚠️ ACTIVO' : '✅ Normal'}\n\n` +
+          (enabled
+            ? '3% → BULL + WR≥60% + DD<2%\n2% → Normal\n1% → DD>5%'
+            : 'Activa DYNAMIC_RISK=true en Render para el modo dinámico (Nivel 2)')
+        );
+      }
       else if (text === '/emergencia ON' || text === '/emergencia on') {
         vixSpikeActive = true;
         vixSpikeUntil  = null; // manual — no expira solo
-        await sendTelegram('🚨 <b>EMERGENCIA ACTIVADA</b>
-Entradas bloqueadas indefinidamente.
-Usa /emergencia OFF para reanudar.');
+        await sendTelegram('🚨 <b>EMERGENCIA ACTIVADA</b>\nEntradas bloqueadas indefinidamente.\nUsa /emergencia OFF para reanudar.');
         console.log('[EMERGENCIA] Kill switch activado manualmente');
       }
       else if (text === '/emergencia OFF' || text === '/emergencia off') {
         vixSpikeActive = false;
         vixSpikeUntil  = null;
-        await sendTelegram('✅ <b>Emergencia desactivada</b>
-Entradas reanudadas normalmente.');
+        await sendTelegram('✅ <b>Emergencia desactivada</b>\nEntradas reanudadas normalmente.');
         console.log('[EMERGENCIA] Kill switch desactivado');
       }
       else if (text === '/ayuda' || text === '/help' || text === '/start') {
@@ -4510,7 +4576,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.49.5',
+    version:       '3.49.6',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
