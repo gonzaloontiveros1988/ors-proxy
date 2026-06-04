@@ -905,6 +905,27 @@ async function executeSell(sym, qty, reason, price) {
   }
   if(!qty || qty < 1) return false;
   try {
+    // v3.50.8f: verificar posición LONG en Alpaca antes de vender
+    // Evita crear SHORTs inadvertidos cuando el servidor pierde estado
+    try {
+      const posChk = await fetch(`${alpacaBase()}/v2/positions/${sym}`, {headers:alpacaHeaders()});
+      if (posChk.status === 404) {
+        console.log(`[EXEC-SELL] ${sym}: sin posición en Alpaca — cancelando venta`);
+        delete openPositions[sym];
+        return false;
+      }
+      if (posChk.status === 200) {
+        const posData = await posChk.json();
+        if (parseFloat(posData.qty||'0') <= 0) {
+          console.log(`[EXEC-SELL] ${sym}: posición ≤0 en Alpaca — cancelando venta`);
+          delete openPositions[sym];
+          return false;
+        }
+      }
+    } catch(posErr) {
+      console.log(`[EXEC-SELL] ${sym}: no se pudo verificar posición — procediendo con cautela`);
+    }
+
     // Cancelar TODAS las órdenes abiertas del ticker antes de vender
     const openOrders = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       {headers:alpacaHeaders()}).then(r=>r.json()).catch(()=>[]);
@@ -6606,13 +6627,21 @@ app.listen(PORT, async () => {
   console.log(`ORS Proxy v2 running on port ${PORT}`);
   console.log(`Mode: ${USE_PAPER ? 'PAPER TRADING' : 'LIVE'} | Account: ${USE_PAPER ? IBKR_PAPER : IBKR_ACCOUNT}`);
 
-  // ── DIAGNÓSTICO ALPACA AL ARRANQUE ─────────────────────────────
+  // ── DIAGNÓSTICO Y SINCRONIZACIÓN AL ARRANQUE ────────────────────
   setTimeout(async () => {
     try {
       const acc = getAcc();
       console.log(`[STARTUP] Cuenta activa: ${ACTIVE_ACCOUNT}`);
       console.log(`[STARTUP] Base URL: ${acc.base}`);
       console.log(`[STARTUP] Key: ${acc.key.slice(0,8)}...`);
+
+      // SYNC: limpiar openPositions al arrancar — evita vender posiciones inexistentes
+      // El estado en memoria no es fiable tras un reinicio del servidor
+      const nPos = Object.keys(openPositions).length;
+      if (nPos > 0) {
+        console.log(`[STARTUP] ⚠️ Limpiando ${nPos} posiciones en memoria — se resincronizarán con Alpaca`);
+        Object.keys(openPositions).forEach(sym => delete openPositions[sym]);
+      }
 
       // Test 1: verificar cuenta
       const accResp = await fetch(`${alpacaBase()}/v2/account`, { headers: alpacaHeaders() });
