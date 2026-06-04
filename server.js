@@ -376,7 +376,11 @@ const ALPACA_ACCOUNTS = {
 let ACTIVE_ACCOUNT = process.env.ALPACA_DEFAULT_ACCOUNT || 'paper2';
 
 function getAcc()        { return ALPACA_ACCOUNTS[ACTIVE_ACCOUNT] || ALPACA_ACCOUNTS.paper; }
-function alpacaBase()    { return getAcc().base; }
+function alpacaBase() {
+  // Limpiar /v2 del final si viene en la variable de entorno
+  var base = getAcc().base || 'https://paper-api.alpaca.markets';
+  return base.replace(/\/v2\/?$/, '').replace(/\/$/, '');
+}
 function alpacaHeaders() {
   const acc = getAcc();
   return { 'APCA-API-KEY-ID': acc.key, 'APCA-API-SECRET-KEY': acc.secret, 'Content-Type': 'application/json' };
