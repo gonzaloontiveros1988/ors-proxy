@@ -810,6 +810,35 @@ async function closePosition(sym) {
 var tradeHistory = [];   // historial de operaciones cerradas
 var decisionLog  = [];   // log de decisiones con todas las condiciones
 const MAX_HISTORY = 500; // máximo 500 operaciones en memoria
+const TRADE_HISTORY_FILE = '/tmp/trade_history.json';
+
+// Cargar historial desde disco al arrancar
+(function loadTradeHistory() {
+  try {
+    const fs = require('fs');
+    if (fs.existsSync(TRADE_HISTORY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TRADE_HISTORY_FILE, 'utf8'));
+      tradeHistory = data.tradeHistory || [];
+      decisionLog  = data.decisionLog  || [];
+      console.log(`[DIARY] ✅ Historial cargado: ${tradeHistory.length} trades`);
+    }
+  } catch(e) {
+    console.log('[DIARY] Sin historial previo — empezando desde cero');
+  }
+})();
+
+function saveTradeDiary() {
+  try {
+    const fs = require('fs');
+    fs.writeFileSync(TRADE_HISTORY_FILE, JSON.stringify({
+      tradeHistory: tradeHistory.slice(0, MAX_HISTORY),
+      decisionLog:  decisionLog.slice(0, MAX_HISTORY),
+      saved: new Date().toISOString(),
+    }));
+  } catch(e) {
+    console.log('[DIARY] Error guardando historial:', e.message);
+  }
+}
 
 // Guardar operación al ABRIR — captura todas las condiciones
 function logDecision(sym, order, conditions) {
@@ -846,6 +875,7 @@ function logDecision(sym, order, conditions) {
   decisionLog.unshift(entry);
   if(decisionLog.length > MAX_HISTORY) decisionLog = decisionLog.slice(0, MAX_HISTORY);
   console.log(`[LOG] Decisión registrada: ${sym} ${entry.system} @ $${order.price}`);
+  saveTradeDiary(); // Persistir entrada también
   return entry.id;
 }
 
@@ -892,6 +922,7 @@ function logExit(sym, exitPrice, exitReason, pnlEur) {
   tradeHistory.unshift(trade);
   if(tradeHistory.length > MAX_HISTORY) tradeHistory = tradeHistory.slice(0, MAX_HISTORY);
   console.log(`[LOG] Trade cerrado: ${sym} ${pnlEur >= 0 ? '+' : ''}€${pnlEur} (${exitReason})`);
+  saveTradeDiary(); // Persistir a disco inmediatamente
 }
 
 async function executeSell(sym, qty, reason, price) {
@@ -6627,7 +6658,24 @@ app.listen(PORT, async () => {
   console.log(`ORS Proxy v2 running on port ${PORT}`);
   console.log(`Mode: ${USE_PAPER ? 'PAPER TRADING' : 'LIVE'} | Account: ${USE_PAPER ? IBKR_PAPER : IBKR_ACCOUNT}`);
 
-  // ── DIAGNÓSTICO Y SINCRONIZACIÓN AL ARRANQUE ────────────────────
+  // ── AÑADIR TRADE MU MANUALMENTE (primer trade real paper2) ─────
+// MU entrada $1.023.075, 8 shares, stop $1.001.66
+// Se añade una vez si no está ya en el historial
+(function addMUTrade() {
+  const alreadyAdded = tradeHistory.some(function(t){ return t.sym==='MU' && t.date==='2026-06-04'; });
+  if (!alreadyAdded) {
+    decisionLog.unshift({
+      id: 'MU_20260604', sym: 'MU', date: '2026-06-04T18:17:00.000Z',
+      system: 'MOM', type: 'MOM', entry: 1023.075, stop: 1001.66,
+      qty: 8, account: 'paper2', result: null,
+      conditions: { rsi: null, rvol: null },
+    });
+    saveTradeDiary();
+    console.log('[DIARY] Trade MU 2026-06-04 añadido al diario');
+  }
+})();
+
+// ── DIAGNÓSTICO Y SINCRONIZACIÓN AL ARRANQUE ────────────────────
   setTimeout(async () => {
     try {
       const acc = getAcc();
