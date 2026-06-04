@@ -6602,6 +6602,52 @@ app.listen(PORT, async () => {
   console.log(`ORS Proxy v2 running on port ${PORT}`);
   console.log(`Mode: ${USE_PAPER ? 'PAPER TRADING' : 'LIVE'} | Account: ${USE_PAPER ? IBKR_PAPER : IBKR_ACCOUNT}`);
 
+  // ── DIAGNÓSTICO ALPACA AL ARRANQUE ─────────────────────────────
+  setTimeout(async () => {
+    try {
+      const acc = getAcc();
+      console.log(`[STARTUP] Cuenta activa: ${ACTIVE_ACCOUNT}`);
+      console.log(`[STARTUP] Base URL: ${acc.base}`);
+      console.log(`[STARTUP] Key: ${acc.key.slice(0,8)}...`);
+
+      // Test 1: verificar cuenta
+      const accResp = await fetch(`${alpacaBase()}/v2/account`, { headers: alpacaHeaders() });
+      const accText = await accResp.text();
+      if (accResp.status === 200) {
+        const accData = JSON.parse(accText);
+        console.log(`[STARTUP] ✅ Cuenta OK: ${accData.id} | Buying power: $${parseFloat(accData.buying_power).toFixed(0)}`);
+        await sendTelegram(`✅ <b>Alpaca verificado</b>
+Cuenta: ${accData.id}
+Buying power: $${parseFloat(accData.buying_power).toFixed(0)}
+Base: ${acc.base}`);
+      } else {
+        console.log(`[STARTUP] ❌ Cuenta ERROR status ${accResp.status}: ${accText.slice(0,200)}`);
+        await sendTelegram(`❌ <b>Error Alpaca al arrancar</b>
+Status: ${accResp.status}
+${accText.slice(0,200)}`);
+      }
+
+      // Test 2: verificar TSM y tickers problemáticos
+      const testTickers = ['TSM','NVDA','AMD','MRVL'];
+      for (const tk of testTickers) {
+        const assetResp = await fetch(`${alpacaBase()}/v2/assets/${tk}`, { headers: alpacaHeaders() });
+        const assetStatus = assetResp.status;
+        if (assetStatus === 200) {
+          const asset = await assetResp.json();
+          const tradable = asset.tradable && asset.status === 'active';
+          console.log(`[STARTUP] ${tk}: ${tradable ? '✅ tradable' : '⚠️ no tradable'} (${asset.status})`);
+          if (!tradable) markUnavailable(tk);
+        } else {
+          console.log(`[STARTUP] ${tk}: status ${assetStatus} — marcado no disponible`);
+          markUnavailable(tk);
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch(e) {
+      console.log('[STARTUP] Error diagnóstico:', e.message);
+    }
+  }, 3000);
+
   // Send startup message
   await sendTelegram(
     `🚀 <b>ORS Proxy arrancado</b>\n\n` +
