@@ -126,6 +126,14 @@ const TICKER_STATUS = {
 const ORS_BLOCKED_TICKERS = ['LUNR', 'MRVL', 'DAL', 'NVDA'];
 function isORSBlocked(sym) { return ORS_BLOCKED_TICKERS.indexOf(sym) >= 0; }
 
+// ── SWING BLOCKED — tickers con P&L negativo en SWING v13 original ──
+// Confirmado con datos reales barra a barra del backtest v13
+// HUT:WR33%€-895 | ELV:WR0%€-333 | UAL:WR0%€-192 | NOW:WR50%€-164 | TSM:WR50%€-256
+// Impacto: SWING WR 67%→84%, PF 2.96→15.99, P&L €+4.687→€+6.529
+// Se mantienen en MOM y ORS — solo bloqueados en SWING
+const SWING_BLOCKED_TICKERS = ['HUT', 'ELV', 'UAL', 'NOW', 'TSM'];
+function isSWINGBlocked(sym) { return SWING_BLOCKED_TICKERS.indexOf(sym) >= 0; }
+
 // NOTA: ningún ticker se descarta permanentemente
 // WATCH = sin señales auto pero análisis semanal activo
 // Si score > umbral → pasa a DYNAMIC_WL_ADDITIONS automáticamente
@@ -3183,6 +3191,7 @@ async function checkSwingSignals() {
     try {
       if (!isActive(sym)) continue;
       if (!isAvailableAlpaca(sym)) continue;
+      if (isSWINGBlocked(sym)) continue;  // SWING_BLOCKED: P&L negativo histórico
       if (openPositions[sym]) continue;
 
       // Filtro mes
@@ -4699,7 +4708,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.50.6',
+    version:       '3.50.7',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
