@@ -1233,10 +1233,12 @@ ${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
         // SISTEMA SWING — Pullback en canal MAC
         // ════════════════════════════════════════════════════
 
-        // SWING→MOM upgrade: precio rompe MAH_1H con gap >1.5% + momentum
+        // ── SWING→MOM UPGRADE — verificar PRIMERO antes de salidas ──────
+        // v13c: el upgrade se verifica antes que la lógica de salida
+        // Trigger suavizado: cierre sobre MAH (sin gap mínimo) + OBV bullish
         if (!pos.upgradedToMOM && pos.MAH_1H) {
           const gapOverMAH = (price - pos.MAH_1H) / pos.MAH_1H;
-          if (gapOverMAH > 0.015 && prices15) {
+          if (gapOverMAH > 0.015 && prices15) {  // gap >1.5% (v13 original)
             const obvSwUpg  = calcOBV(prices15);
             const rsiSwUpg  = calcRSI(prices15, 14);
             const vSwUpg    = prices15.slice(-21).map(p=>p.volume||0);
@@ -1277,13 +1279,15 @@ ${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
           );
         }
 
-        // Runner EMA20 tras PT1
+        // Runner EMA20 tras PT1 (v13 original — backtest confirmado)
         if (pos.breakevenDone && prices15) {
           const ema20S = calcEMA(prices15, Math.min(20, prices15.length));
           const obvS   = calcOBV(prices15);
           if (ema20S && price > ema20S && obvS?.bullish) {
             const rs = parseFloat(ema20S.toFixed(2));
-            if (rs > pos.stopPrice + 0.20) { pos.stopPrice = rs; pos.isRunner = true; openPositions[sym] = pos; }
+            if (rs > pos.stopPrice + 0.20) {
+              pos.stopPrice = rs; pos.isRunner = true; openPositions[sym] = pos;
+            }
             if (price <= pos.stopPrice) {
               await executeSell(sym, totalQty, `SWING Runner EMA20 $${pos.stopPrice}`, price);
               delete openPositions[sym]; continue;
@@ -1307,6 +1311,26 @@ ${pos.qty2} acc @ $${price.toFixed(2)} · +€${pnl}
           if (bc >= 2) {
             await executeSell(sym, totalQty, `SWING N4 agotamiento`, price);
             delete openPositions[sym]; continue;
+          }
+        }
+
+        // ── DANGER ZONE SWING (DZ35%) ────────────────────────────────
+        // Mismo que ORS: si en 4-7 barras no sube >0.3% → stop al 35% riesgo
+        const barsHeldSW = Math.round((Date.now() - pos.ts) / (15*60*1000));
+        if (!pos.dangerZoneDone && !pos.breakevenDone && barsHeldSW >= 4 && barsHeldSW <= 7) {
+          const gainSW = (price - pos.entryPrice) / pos.entryPrice * 100;
+          if (gainSW < 0.3) {
+            const dz35SW = pos.entryPrice - (pos.entryPrice - pos.originalStop) * 0.35;
+            const newStopSW = parseFloat(dz35SW.toFixed(2));
+            if (newStopSW > pos.stopPrice) {
+              pos.stopPrice = newStopSW;
+              pos.dangerZoneDone = true;
+              openPositions[sym] = pos;
+              console.log(`[DZ35-SWING] ${sym} stop → $${newStopSW}`);
+            }
+          } else {
+            pos.dangerZoneDone = true;
+            openPositions[sym] = pos;
           }
         }
 
@@ -4675,7 +4699,7 @@ app.get('/health', (req, res) => {
   const vixRegime = getVIXSystemRegime();
   res.json({
     status:        'ok',
-    version:       '3.50.4',
+    version:       '3.50.6',
     deployed:      new Date().toISOString().slice(0,10),
     account:       getAcc().label,
     accountId:     ACTIVE_ACCOUNT,
