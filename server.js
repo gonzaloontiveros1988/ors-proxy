@@ -469,7 +469,7 @@ function capQty(qty, price, is5of5) {
 
 // ── ATR MÍNIMO — evita sizing desproporcionado en tickers baratos ──
 function adjustedATR(atr, price) {
-  const minAtrPct = 0.005;
+  const minAtrPct = 0.005; // 0.5% mínimo
   return (atr / price) < minAtrPct ? price * minAtrPct : atr;
 }
 
@@ -2319,8 +2319,8 @@ function calcORSSignal(prices, quote) {
   // FIX: ATR mínimo 0.5% del precio (evita tickers con ATR demasiado pequeño)
   let suggestedQty = null, stopPrice = null, suggestedQty2 = null;
   if (atr && last) {
-    // Si el ATR es menor del 0.5% del precio, el ticker es demasiado estable
-    // para ORS — el sizing sería desproporcionado
+    // Si el ATR es menor del 0.5% del precio → usar 0.5% mínimo
+    // v3.50.8: atrMinPct 0.5% confirmado como óptimo (backtest v13d)
     const atrPct = atr / last;
     const atrMinPct = 0.005; // 0.5% mínimo
     const atrAdjusted = atrPct < atrMinPct ? last * atrMinPct : atr;
