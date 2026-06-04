@@ -823,7 +823,7 @@ function logDecision(sym, order, conditions) {
     stop:       order.stopPrice,
     target:     order.target1,
     qty:        (order.qty1||0) + (order.qty2||0),
-    account:    activeAccount,
+    account:    ACTIVE_ACCOUNT,
     conditions: {
       rsi:       conditions.rsi      || null,
       rvol:      conditions.rvol     || null,
@@ -885,7 +885,7 @@ function logExit(sym, exitPrice, exitReason, pnlEur) {
     exitReason: exitReason,
     daysHeld:   daysHeld,
     win:        pnlEur >= 0,
-    account:    activeAccount,
+    account:    ACTIVE_ACCOUNT,
     conditions: logEntry ? logEntry.conditions : {},
   };
 
@@ -6432,7 +6432,7 @@ app.get('/trades/history', (req, res) => {
       winRate: wr,
       totalPnlEur: Math.round(totalPnl),
       avgWin, avgLoss,
-      account: activeAccount,
+      account: ACTIVE_ACCOUNT,
     },
     trades,
   });
