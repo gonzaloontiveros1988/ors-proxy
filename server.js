@@ -422,16 +422,16 @@ let scanMOMCache = null;    // caché del último scan MOM — BUG FIX: era loca
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
 const MAX_POSITIONS     = parseInt(process.env.MAX_POSITIONS || '5'); // 5 slots total
 
-// Límites por régimen de mercado (calculados dinámicamente)
-// BULL:    MOM≤3  ORS≤1  SWING≤1
-// LATERAL: MOM≤2  ORS≤2  SWING≤1
-// BEAR:    MOM≤0  ORS≤2  SWING≤0
+// Límites por régimen de mercado — MOM puro v5b (ORS y SWING desactivados)
+// BULL:    MOM≤5
+// LATERAL: MOM≤4
+// BEAR:    MOM≤2
 function getMaxBySystem(system) {
   const mode = MARKET_REGIME?.mode || 'BULL';
   const limits = {
-    BULL:    { MOM: 3, ORS: 1, SWING: 1 },
-    LATERAL: { MOM: 2, ORS: 2, SWING: 1 },
-    BEAR:    { MOM: 0, ORS: 2, SWING: 0 },
+    BULL:    { MOM: 5, ORS: 0, SWING: 0 },
+    LATERAL: { MOM: 4, ORS: 0, SWING: 0 },
+    BEAR:    { MOM: 2, ORS: 0, SWING: 0 },
   };
   return (limits[mode] || limits.BULL)[system] || 0;
 }
@@ -445,7 +445,7 @@ function canOpenPosition(system) {
 }
 // Compatibilidad con código existente
 const MAX_POSITIONS_ORS = 2; // máx absoluto (régimen puede limitarlo más)
-const MAX_POSITIONS_MOM = 3; // máx absoluto
+const MAX_POSITIONS_MOM = 5; // MOM puro v5b — todos los slots para MOM
 
 // Contar posiciones abiertas por sistema
 function countORSPositions() {
@@ -6777,18 +6777,17 @@ ${accText.slice(0,200)}`);
     } catch(e){ console.log('[SYNC] Could not load positions:', e.message); }
   }, 5000);
 
-  // Check signals every 5 min
-  setTimeout(checkSignals, 8000);
-  setInterval(checkSignals, 5 * 60 * 1000);
+  // Check signals every 5 min — ORS DESACTIVADO (MOM puro v5b)
+  // setTimeout(checkSignals, 8000);
+  // setInterval(checkSignals, 5 * 60 * 1000);
 
   // MOM signals every 5 min (desfasado 2.5min de ORS para no solapar)
   setTimeout(checkMOMSignals, 30000); // 30s tras arranque (era 150s)
   setInterval(checkMOMSignals, 5 * 60 * 1000);
 
-  // SWING signals cada 15min (usa datos 1H — no necesita más frecuencia)
-  // Desfasado 75s de MOM para no solapar llamadas Alpaca
-  setTimeout(checkSwingSignals, 75000);
-  setInterval(checkSwingSignals, 15 * 60 * 1000);
+  // SWING signals — DESACTIVADO (MOM puro v5b)
+  // setTimeout(checkSwingSignals, 75000);
+  // setInterval(checkSwingSignals, 15 * 60 * 1000);
 
   // ── Régimen de mercado — 1x al día al cierre del mercado (20:05 UTC) ────────
   // SMA50/SMA200 son medias de días — no tiene sentido calcularlas cada hora.
