@@ -816,7 +816,7 @@ async function checkMOMSignals() {
       const icon = sig.type === 'BOLL' ? '📉' : '🚀';
       await sendTelegram(
         `${icon} <b>${sig.type} SIGNAL — ${sym}</b>\n\n` +
-        `💰 $${sig.last.toFixed(2)} | Stop: $${stop} ${target?`| Target: $${target.toFixed(2)}`:'}\n'` +
+        `💰 $${sig.last.toFixed(2)} | Stop: $${stop}` + (target ? ` | Target: $${target.toFixed(2)}` : '') + `\n` +
         `📦 ${qty} acc | RSI ${sig.rsi} | RVOL ${sig.rvol}x\n\n` +
         `✅ /ejecutar_${sym}   ❌ /cancelar_${sym}`
       );
