@@ -1,4 +1,4 @@
-// server.js — v3.1.0
+/// server.js — v3.1.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (4 slots) + Bollinger (1 slot)
@@ -1245,6 +1245,38 @@ app.get('/alpaca/positions', async (req, res) => {
   const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
   res.json(await r.json());
 });
+app.get('/alpaca/bars/daily', async (req, res) => {
+  const { sym, limit = 504 } = req.query;
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+  try {
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
+    const r   = await fetch(url, { headers: alpacaHdr() });
+    const d   = await r.json();
+    if (!d.bars) return res.json({ sym, bars: [], count: 0 });
+    const bars = d.bars.map(b => ({
+      t: b.t.slice(0, 10), o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0,
+    }));
+    res.json({ sym, bars, count: bars.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/alpaca/bars/15min', async (req, res) => {
+  const { sym, limit = 200, start } = req.query;
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+  try {
+    const startDate = start || new Date(Date.now() - 7*24*3600*1000).toISOString().slice(0,10);
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=15Min&limit=${limit}&feed=iex&sort=asc&start=${startDate}`;
+    const r   = await fetch(url, { headers: alpacaHdr() });
+    const text = await r.text();
+    if (!text || text === 'Not Found') return res.json({ sym, bars: [], prices15: [], count: 0 });
+    const d = JSON.parse(text);
+    if (!d.bars) return res.json({ sym, bars: [], prices15: [], count: 0 });
+    const bars = d.bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
+    const prices15 = bars.map(b => b.c);
+    res.json({ sym, bars, prices15, count: bars.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/alpaca/snapshots', async (req, res) => {
   const { syms } = req.query;
   if (!syms) return res.json({});
