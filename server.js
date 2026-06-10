@@ -1,4 +1,4 @@
-/// server.js — v3.1.0
+// server.js — v3.2.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (4 slots) + Bollinger (1 slot)
@@ -28,7 +28,7 @@ const EUR_USD    = 1.08;
 const SLIPPAGE   = 0.001;
 let CAPITAL_EUR  = parseFloat(process.env.CAPITAL_EUR || '11480');
 const RISK_PCT   = parseFloat(process.env.RISK_PCT    || '0.02');
-const MAX_MOM    = 4;
+const MAX_MOM    = 5;
 const MAX_BOLL   = 1;
 const MAX_SHORT  = 3;
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
@@ -247,6 +247,18 @@ async function fetchSnapshot(sym) {
     const price = lt.p || snap.dailyBar?.c || 0;
     return { price, changePct: prev.c ? (price - prev.c) / prev.c * 100 : 0 };
   } catch(e) { return null; }
+}
+
+// Drawdown SPY desde máximo 60 días — para filtro de crisis
+async function spyDrawdown60() {
+  try {
+    const bars = await fetchDailyBars('SPY', 65);
+    if (!bars || bars.length < 10) return 0;
+    const closes = bars.map(b => b.c);
+    const current = closes[closes.length - 1];
+    const max60   = Math.max(...closes.slice(-60));
+    return (current - max60) / max60 * 100; // negativo = caída
+  } catch(e) { return 0; }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -694,6 +706,13 @@ async function checkShortSignals() {
   if (reg.mode !== 'BEAR')            return;
   if (reg.bearStreak < BEAR_MIN_DAYS) return;
   if (!reg.sma50Bearish)              return;
+  // Filtro crisis: SHORT solo cuando SPY DD>10% desde máximo 60 días
+  const spyDD = await spyDrawdown60();
+  if (spyDD >= -10.0) {
+    console.log(`[SHORT] Bloqueado — SPY DD ${spyDD.toFixed(1)}% (umbral: -10%)`);
+    return;
+  }
+  console.log(`[SHORT] ✅ Crisis activa — SPY DD ${spyDD.toFixed(1)}%`);
   const shortCount = Object.values(openPositions).filter(p => p.system === 'SHORT').length;
   if (shortCount >= MAX_SHORT) return;
   console.log(`[SHORT] BEAR bearStreak:${reg.bearStreak} | SHORT:${shortCount}/${MAX_SHORT}`);
@@ -986,7 +1005,7 @@ async function pollTelegram() {
       }
       else if (text === '/ayuda' || text === '/help') {
         await sendTelegram(
-          `🤖 <b>ORS V3.1</b>\n\n` +
+          `🤖 <b>ORS V3.2</b>\n\n` +
           `<b>ÓRDENES</b>\n` +
           `/si — Confirmar última orden\n` +
           `/no — Cancelar última orden\n` +
@@ -1018,7 +1037,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.1', version: '3.1.0',
+  status: 'ORS V3.2', version: '3.2.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1026,7 +1045,7 @@ app.get('/', (req, res) => res.json({
 }));
 
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.1.0',
+  status: 'ok', version: '3.2.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1288,10 +1307,10 @@ app.get('/alpaca/snapshots', async (req, res) => {
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3 — puerto ${PORT}`);
+  console.log(`ORS V3.2 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   await sendTelegram(
-    `🚀 <b>ORS V3.1 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.2 arrancado</b>\n\n` +
     `BULL:    MOM (4) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
