@@ -1,4 +1,4 @@
-// server.js — v3.2.0
+// server.js — v3.3.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (4 slots) + Bollinger (1 slot)
@@ -437,6 +437,8 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
   if (gainPct >= beThr && !pos.be) {
     pos.stop = parseFloat((pos.entry * 1.001).toFixed(2));
     pos.be   = true;
+    await updateAlpacaStop(sym, pos.qty, pos.stop, false);
+    console.log(`[BE] ${sym} stop → $${pos.stop}`);
   }
   if (pos.be && dailyBars && dailyBars.length >= 20) {
     const dCloses = dailyBars.map(b => b.c);
@@ -445,7 +447,11 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
     if (ema20 && obvD) {
       if (price > ema20 && obvD.bullish) {
         const rs = parseFloat(ema20.toFixed(2));
-        if (rs > pos.stop) { pos.stop = rs; pos.runner = true; }
+        if (rs > pos.stop) {
+          pos.stop = rs; pos.runner = true;
+          await updateAlpacaStop(sym, pos.qty, pos.stop, false);
+          console.log(`[RUNNER] ${sym} stop → $${pos.stop}`);
+        }
       } else if (pos.runner) {
         const ep  = price * (1 - SLIPPAGE);
         const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
@@ -476,6 +482,8 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
   if (gainPct >= 3.0 && !pos.be) {
     pos.stop = parseFloat((pos.entry * 0.999).toFixed(2));
     pos.be   = true;
+    await updateAlpacaStop(sym, pos.qty, pos.stop, true);
+    console.log(`[BE] SHORT ${sym} stop → $${pos.stop}`);
   }
   if (pos.be && dailyBars && dailyBars.length >= 20) {
     const dCloses = dailyBars.map(b => b.c);
@@ -484,7 +492,11 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
     if (ema20 && obvD) {
       if (price < ema20 && obvD.bearish) {
         const rs = parseFloat(ema20.toFixed(2));
-        if (rs < pos.stop) { pos.stop = rs; pos.runner = true; }
+        if (rs < pos.stop) {
+          pos.stop = rs; pos.runner = true;
+          await updateAlpacaStop(sym, pos.qty, pos.stop, true);
+          console.log(`[RUNNER] SHORT ${sym} stop → $${pos.stop}`);
+        }
       } else if (pos.runner) {
         const ep  = price * (1 + SLIPPAGE);
         const pnl = (pos.entry - ep) * pos.qty / EUR_USD;
@@ -614,6 +626,48 @@ async function executeSell(sym, qty, reason, price) {
 }
 
 // ═══════════════════════════════════════════════════════
+// ACTUALIZAR STOP EN ALPACA
+// ═══════════════════════════════════════════════════════
+async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
+  try {
+    // 1. Cancelar órdenes stop abiertas del ticker
+    const openOrds = await fetch(
+      `${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
+      { headers: alpacaHdr() }
+    ).then(r => r.json()).catch(() => []);
+
+    for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
+      if (ord.type === 'stop' || ord.type === 'stop_limit') {
+        await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
+          { method: 'DELETE', headers: alpacaHdr() }).catch(() => {});
+      }
+    }
+
+    // 2. Crear nueva orden stop
+    const side = isShort ? 'buy' : 'sell';
+    const r = await fetch(`${alpacaBase()}/v2/orders`, {
+      method: 'POST', headers: alpacaHdr(),
+      body: JSON.stringify({
+        symbol: sym, qty: String(qty), side,
+        type: 'stop', stop_price: String(newStop),
+        time_in_force: 'gtc',
+      }),
+    });
+    const o = await r.json();
+    if (o.id) {
+      console.log(`[STOP] ✅ ${sym} stop actualizado → $${newStop}`);
+      return true;
+    } else {
+      console.log(`[STOP] ❌ ${sym} error: ${o.message || JSON.stringify(o).slice(0,80)}`);
+      return false;
+    }
+  } catch(e) {
+    console.log(`[STOP] Error ${sym}:`, e.message);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // SCANNER — MOM + BOLL
 // ═══════════════════════════════════════════════════════
 async function checkMOMSignals() {
@@ -652,6 +706,8 @@ async function checkMOMSignals() {
             const s20 = bars15.length >= 21 ? bars15[bars15.length-21].c : null;
             if (s20 && s20 > 0) rs = (sig.last/s20-1)*100 - (spyLast/spy20-1)*100;
           }
+          // H2: RS mínimo +2% vs SPY en 20 días
+          if (rs < 2.0) continue;
           candidates.push({ ...sig, rs, type:'MOM' });
         }
       }
@@ -1037,7 +1093,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.2', version: '3.2.0',
+  status: 'ORS V3.2', version: '3.3.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1045,7 +1101,7 @@ app.get('/', (req, res) => res.json({
 }));
 
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.2.0',
+  status: 'ok', version: '3.3.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1307,10 +1363,10 @@ app.get('/alpaca/snapshots', async (req, res) => {
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.2 — puerto ${PORT}`);
+  console.log(`ORS V3.3.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   await sendTelegram(
-    `🚀 <b>ORS V3.2 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.3.0 arrancado</b>\n\n` +
     `BULL:    MOM (4) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
