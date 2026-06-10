@@ -1,17 +1,12 @@
-// server.js — v3.0.0
+// server.js — v3.1.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (4 slots) + Bollinger (1 slot)
 // LATERAL: MOM V1 75% sizing (5 slots)
 // BEAR:    SHORT v3 filtros A+D (3 slots)
 //
-// Validado en backtest IBKR 2021-2026:
-//   MOM+BOLL: PF 3.06 OOS  WFE 0.94
-//   MOM LATERAL: PF 5.07 OOS  WFE 1.53
-//   SHORT v3: PF 2.97 OOS  WFE 0.93
-
+// v3.1.0: /sync + /sync/history endpoints
 'use strict';
-
 const express = require('express');
 const app = express();
 app.use(express.json());
@@ -31,27 +26,20 @@ const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_CHAT    = process.env.TG_CHAT    || '';
 const EUR_USD    = 1.08;
 const SLIPPAGE   = 0.001;
-
-// Capital y riesgo
 let CAPITAL_EUR  = parseFloat(process.env.CAPITAL_EUR || '11480');
 const RISK_PCT   = parseFloat(process.env.RISK_PCT    || '0.02');
-
-// Slots por sistema
 const MAX_MOM    = 4;
 const MAX_BOLL   = 1;
 const MAX_SHORT  = 3;
-
-// Ejecución automática
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
 
 // ── ALPACA ────────────────────────────────────────────
 const ALPACA_DATA = 'https://data.alpaca.markets';
-
 const ALPACA_ACCOUNTS = {
   paper2: {
-    key:    process.env.ALPACA_KEY_2    || '',
-    secret: process.env.ALPACA_SECRET_2 || '',
-    base:   'https://paper-api.alpaca.markets',
+    key:    process.env.ALPACA_KEY_2    || process.env.ALPACA_KEY    || '',
+    secret: process.env.ALPACA_SECRET_2 || process.env.ALPACA_SECRET || '',
+    base:   process.env.ALPACA_BASE     || 'https://paper-api.alpaca.markets',
     label:  '📊 PAPER €11k',
   },
   live: {
@@ -61,7 +49,6 @@ const ALPACA_ACCOUNTS = {
     label:  '💰 LIVE',
   },
 };
-
 let ACTIVE_ACCOUNT = process.env.ALPACA_DEFAULT_ACCOUNT || 'paper2';
 const getAcc    = () => ALPACA_ACCOUNTS[ACTIVE_ACCOUNT] || ALPACA_ACCOUNTS.paper2;
 const alpacaBase= () => getAcc().base;
@@ -74,29 +61,19 @@ const isLive = () => ACTIVE_ACCOUNT === 'live';
 
 // ── UNIVERSO ──────────────────────────────────────────
 const UNIVERSE = [
-  // AI / Chips
   'NVDA','AMD','AVGO','TSM','MU','QCOM','MRVL','SMCI','ORCL','PLTR',
-  // Cloud / Software
   'META','AMZN','GOOGL','MSFT','NFLX','CRM','NOW','SNOW','DDOG','MDB',
   'CRWD','PANW','NET','CRWV',
-  // Healthcare / Biotech
   'HCA','ISRG','UNH','LLY','VRTX','ABBV','AMGN','GILD','REGN','MRNA',
   'INSM','CRSP','ALNY',
-  // Energy / Nuclear
   'CEG','VST','GEV','NEE','ETR','XOM','CVX','OXY',
-  // Airlines
   'DAL','UAL','AAL',
-  // Industrial / Defense
   'CAT','HON','ROK','GD','LMT','RTX','FDX',
-  // Space
   'RKLB','LUNR','TSLA',
-  // Fintech
   'JPM','GS','MS','COIN',
-  // Misc
   'HUT','TKO','BE','AMG','EL','HUM','SMCI',
 ];
 
-// Sector para filtro alcista/bajista
 const SECTOR_MAP = {
   NVDA:'XLK',AMD:'XLK',AVGO:'XLK',TSM:'XLK',MU:'XLK',
   QCOM:'XLK',MRVL:'XLK',SMCI:'XLK',ORCL:'XLK',PLTR:'XLK',
@@ -115,14 +92,13 @@ const SECTOR_MAP = {
 };
 
 // ── ESTADO ────────────────────────────────────────────
-const openPositions   = {};  // sym → posición
-const pendingOrders   = {};  // sym → orden pendiente confirmación
-const sentAlerts      = {};  // keys para evitar duplicados
-const monthlyTrades   = {};  // sym_YYYY-MM → true (1 trade/ticker/mes)
-let   tradeHistory    = [];  // historial cerradas
-let   lastUpdateId    = 0;   // Telegram polling
+const openPositions   = {};
+const pendingOrders   = {};
+const sentAlerts      = {};
+const monthlyTrades   = {};
+let   tradeHistory    = [];
+let   lastUpdateId    = 0;
 
-// ── RÉGIMEN ───────────────────────────────────────────
 let MARKET_REGIME = {
   mode: 'BULL',
   sma50: null, sma200: null,
@@ -130,14 +106,12 @@ let MARKET_REGIME = {
   sizeMult: 1.0, ts: 0,
 };
 
-// ── SECTOR SENTIMENT (Claude análisis diario) ─────────
 let sectorSentiment  = {};
 let sectorLastUpdate = null;
 
 // ═══════════════════════════════════════════════════════
 // INDICADORES
 // ═══════════════════════════════════════════════════════
-
 function calcEMA(prices, n) {
   if (!prices || prices.length < n) return null;
   const k = 2 / (n + 1);
@@ -146,7 +120,6 @@ function calcEMA(prices, n) {
     e = prices[i] * k + e * (1 - k);
   return e;
 }
-
 function calcRSI(prices, n = 14) {
   if (!prices || prices.length < n + 2) return null;
   let gains = [], losses = [];
@@ -163,7 +136,6 @@ function calcRSI(prices, n = 14) {
   }
   return al === 0 ? 100 : parseFloat((100 - 100 / (1 + ag / al)).toFixed(2));
 }
-
 function calcMACD(prices, f = 12, s = 26, sig = 9) {
   if (!prices || prices.length < s + sig + 1) return null;
   const kf = 2/(f+1), ks = 2/(s+1);
@@ -189,7 +161,6 @@ function calcMACD(prices, f = 12, s = 26, sig = 9) {
     bearCross:  pm >= ps && lm < ls,
   };
 }
-
 function calcOBV(bars) {
   if (!bars || bars.length < 10) return null;
   let obv = 0;
@@ -213,7 +184,6 @@ function calcOBV(bars) {
     falling: n >= 3 && series[n-1] < series[n-3],
   };
 }
-
 function calcATR(bars, n = 14) {
   if (!bars || bars.length < n + 1) return null;
   let s = 0;
@@ -224,14 +194,12 @@ function calcATR(bars, n = 14) {
   }
   return s / n;
 }
-
 function calcRVOL(bars, n = 20) {
   if (!bars || bars.length < n + 1) return null;
   const vols = bars.slice(-n-1).map(b => b.v || 0);
   const avg  = vols.slice(0, n).reduce((a, b) => a + b, 0) / n;
   return avg > 0 ? vols[n] / avg : 1;
 }
-
 function calcBollinger(prices, n = 20, k = 2) {
   if (!prices || prices.length < n) return null;
   const slice = prices.slice(-n);
@@ -239,7 +207,6 @@ function calcBollinger(prices, n = 20, k = 2) {
   const sd    = Math.sqrt(slice.reduce((a, b) => a + Math.pow(b - mid, 2), 0) / n);
   return { upper: mid + k*sd, mid, lower: mid - k*sd };
 }
-
 function calcSMA(prices, n) {
   if (!prices || prices.length < n) return null;
   return prices.slice(-n).reduce((a, b) => a + b, 0) / n;
@@ -248,7 +215,6 @@ function calcSMA(prices, n) {
 // ═══════════════════════════════════════════════════════
 // DATOS ALPACA
 // ═══════════════════════════════════════════════════════
-
 async function fetchBars15min(sym) {
   try {
     const start = new Date(Date.now() - 7*24*3600*1000).toISOString().slice(0,10);
@@ -261,7 +227,6 @@ async function fetchBars15min(sym) {
     return d.bars.map(b => ({ t:b.t, o:b.o, h:b.h, l:b.l, c:b.c, v:b.v||0 }));
   } catch(e) { return null; }
 }
-
 async function fetchDailyBars(sym, limit = 220) {
   try {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
@@ -271,7 +236,6 @@ async function fetchDailyBars(sym, limit = 220) {
     return d.bars.map(b => ({ t:b.t.slice(0,10), o:b.o, h:b.h, l:b.l, c:b.c, v:b.v||0 }));
   } catch(e) { return null; }
 }
-
 async function fetchSnapshot(sym) {
   try {
     const r    = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${sym}&feed=iex`, { headers: alpacaHdr() });
@@ -286,9 +250,8 @@ async function fetchSnapshot(sym) {
 }
 
 // ═══════════════════════════════════════════════════════
-// RÉGIMEN DE MERCADO
+// RÉGIMEN
 // ═══════════════════════════════════════════════════════
-
 async function updateRegime() {
   try {
     const bars = await fetchDailyBars('SPY', 210);
@@ -297,8 +260,6 @@ async function updateRegime() {
     const last   = closes[closes.length - 1];
     const sma50  = calcSMA(closes, 50);
     const sma200 = closes.length >= 200 ? calcSMA(closes, 200) : null;
-
-    // Bear streak
     let bearStreak = 0;
     if (sma200) {
       for (let i = closes.length - 1; i >= Math.max(0, closes.length - 6); i--) {
@@ -307,29 +268,22 @@ async function updateRegime() {
         else break;
       }
     }
-
-    // SMA50 bajista
     const sma50Prev  = closes.length >= 55 ? calcSMA(closes.slice(0, -5), 50) : sma50;
     const sma50Bear  = sma50 && sma50Prev && sma50 < sma50Prev;
-
-    // Modo
     let mode, sizeMult;
     if (sma200 && last < sma200 && bearStreak >= 3) {
-      mode = 'BEAR'; sizeMult = 1.0; // SHORT usa su propio sizing
+      mode = 'BEAR'; sizeMult = 1.0;
     } else if (sma50 && last < sma50) {
       mode = 'LATERAL'; sizeMult = 0.75;
     } else {
       mode = 'BULL'; sizeMult = 1.0;
     }
-
     const prev = MARKET_REGIME.mode;
     MARKET_REGIME = { mode, sma50: Math.round(sma50*100)/100,
       sma200: sma200 ? Math.round(sma200*100)/100 : null,
       bearStreak, sma50Bearish: sma50Bear, sizeMult,
       price: last, ts: Date.now() };
-
     console.log(`[REGIME] ${mode} | SPY $${last.toFixed(2)} SMA50 $${sma50.toFixed(2)} bearStreak:${bearStreak}`);
-
     if (prev !== mode) {
       const icons = { BULL:'🟢', LATERAL:'🟡', BEAR:'🔴' };
       await sendTelegram(`${icons[mode]||'⚪'} <b>Régimen: ${prev} → ${mode}</b>\nSPY $${last.toFixed(2)} | SizeMult: ${sizeMult}x`);
@@ -338,15 +292,13 @@ async function updateRegime() {
 }
 
 // ═══════════════════════════════════════════════════════
-// SEÑALES — MOM V1
+// SEÑALES — MOM
 // ═══════════════════════════════════════════════════════
-
 function evalMOM(sym, bars15) {
   if (!bars15 || bars15.length < 50) return null;
   const closes = bars15.map(b => b.c);
   const last   = closes[closes.length - 1];
   if (last < 15) return null;
-
   const r   = calcRSI(closes, 14);
   const o   = calcOBV(bars15);
   const m   = calcMACD(closes);
@@ -354,9 +306,8 @@ function evalMOM(sym, bars15) {
   const a   = calcATR(bars15, 14);
   const rv  = calcRVOL(bars15, 20);
   if (!r || !a || !rv) return null;
-
   const c1 = r >= 45 && r <= 65;
-  const c2 = !!(o && o.bullish && o.rising);   // OBV — obligatorio
+  const c2 = !!(o && o.bullish && o.rising);
   const c3 = !!(m && m.bullish && m.increasing);
   const c4 = !!(e20 && last > e20);
   const n  = bars15.length;
@@ -366,71 +317,53 @@ function evalMOM(sym, bars15) {
     n >= 2 ? (bars15[n-2].h || bars15[n-2].c) : 0,
   );
   const c5 = last > p3h && rv >= 1.5;
-
   const score = [c1,c2,c3,c4,c5].filter(Boolean).length;
   if (score < 4 || !c2) return null;
-
-  // Vela alcista obligatoria
   const lb = bars15[n-1], pb = bars15[n-2] || lb;
   if (lb.c <= (lb.o || pb.c)) return null;
-
-  // 3 velas consecutivas alcistas
   if (n >= 4 && !(bars15[n-1].c > bars15[n-2].c && bars15[n-2].c > bars15[n-3].c)) return null;
-
   return { sym, system:'MOM', last, rsi:r, rvol:parseFloat(rv.toFixed(2)),
            score, atr:a, ema20:e20, signal: score>=5 ? 'OPTIMA' : 'SENAL' };
 }
 
 // ═══════════════════════════════════════════════════════
-// SEÑALES — BOLLINGER BULL
+// SEÑALES — BOLLINGER
 // ═══════════════════════════════════════════════════════
-
 function evalBollinger(sym, dailyBars) {
   if (!dailyBars || dailyBars.length < 205) return null;
   const closes = dailyBars.map(b => b.c);
   const last   = closes[closes.length - 1];
   if (last < 15) return null;
-
   const bb   = calcBollinger(closes, 20, 2);
   const r    = calcRSI(closes, 14);
   const a    = calcATR(dailyBars, 14);
   const rv   = calcRVOL(dailyBars, 20);
   const s200 = calcSMA(closes, 200);
   if (!bb || !r || !a || !rv || !s200) return null;
-
   if (!(last <= bb.lower && r < 35 && last > s200 && rv >= 1.0)) return null;
-
   const stop = Math.min(
     parseFloat((bb.lower - a * 0.5).toFixed(2)),
     parseFloat((last - a * 1.0).toFixed(2)),
   );
-
   return { sym, system:'BOLL', last, rsi:r, rvol:parseFloat(rv.toFixed(2)),
            lower:bb.lower, mid:bb.mid, upper:bb.upper, stop, target:bb.mid, atr:a };
 }
 
 // ═══════════════════════════════════════════════════════
-// SEÑALES — SHORT v3 (BEAR)
+// SEÑALES — SHORT
 // ═══════════════════════════════════════════════════════
-
 const RS_THRESHOLD  = -5.0;
 const BEAR_MIN_DAYS = 5;
-
 function evalShort(sym, bars15, spyRS) {
-  // Filtro A: BEAR estricto
   const reg = MARKET_REGIME;
   if (reg.mode !== 'BEAR')               return null;
   if (reg.bearStreak < BEAR_MIN_DAYS)    return null;
   if (!reg.sma50Bearish)                 return null;
-
-  // Filtro D: RS negativa
   if (spyRS === null || spyRS >= RS_THRESHOLD) return null;
-
   if (!bars15 || bars15.length < 50) return null;
   const closes = bars15.map(b => b.c);
   const last   = closes[closes.length - 1];
   if (last < 15) return null;
-
   const r   = calcRSI(closes, 14);
   const o   = calcOBV(bars15);
   const m   = calcMACD(closes);
@@ -438,9 +371,8 @@ function evalShort(sym, bars15, spyRS) {
   const a   = calcATR(bars15, 14);
   const rv  = calcRVOL(bars15, 20);
   if (!r || !a || !rv) return null;
-
   const c1 = r >= 30 && r <= 55;
-  const c2 = !!(o && o.bearish && o.falling);  // OBV — obligatorio
+  const c2 = !!(o && o.bearish && o.falling);
   const c3 = !!(m && m.bearish && m.decreasing);
   const c4 = !!(e20 && last < e20);
   const n  = bars15.length;
@@ -452,10 +384,8 @@ function evalShort(sym, bars15, spyRS) {
   const c5 = last < p3l && rv >= 1.5;
   const lb = bars15[n-1], pb = bars15[n-2] || lb;
   const c6 = lb.c < (lb.o || pb.c);
-
   const score = [c1,c2,c3,c4,c5,c6].filter(Boolean).length;
   if (score < 5 || !c2) return null;
-
   return { sym, system:'SHORT', last, rsi:r, rvol:parseFloat(rv.toFixed(2)),
            score, atr:a, ema20:e20, rs:spyRS };
 }
@@ -463,7 +393,6 @@ function evalShort(sym, bars15, spyRS) {
 // ═══════════════════════════════════════════════════════
 // SIZING
 // ═══════════════════════════════════════════════════════
-
 function calcQty(entry, stop, sizeMult = 1.0) {
   const riskPer = Math.abs(entry - stop);
   if (riskPer <= 0) return null;
@@ -477,34 +406,26 @@ function calcQty(entry, stop, sizeMult = 1.0) {
 // ═══════════════════════════════════════════════════════
 // GESTIÓN POSICIONES — EXITS
 // ═══════════════════════════════════════════════════════
-
 async function manageLongExit(sym, pos, bar, date, dailyBars) {
   const price = bar.c, low = bar.l || price;
   if (price > (pos.maxPrice || pos.entry)) pos.maxPrice = price;
-
   const gainPct = (price - pos.entry) / pos.entry * 100;
-
-  // Stop
   if (low <= pos.stop) {
     const ep  = pos.stop * (1 - SLIPPAGE);
     const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
     return { close:true, exitPrice:ep, pnl, reason: pos.runner ? 'RunnerStop' : 'Stop' };
   }
-
-  // Bollinger exit — precio toca banda media
   if (pos.system === 'BOLL' && pos.target && price >= pos.target * 0.998 && !pos.be) {
     pos.stop = parseFloat((pos.entry * 1.002).toFixed(2));
     pos.be   = true;
-    await sendTelegram(`🎯 <b>BOLL Target — ${sym}</b>\nPrecio tocó banda media $${pos.target.toFixed(2)}\nStop → Breakeven $${pos.stop}`);
+    await sendTelegram(`🎯 <b>BOLL Target — ${sym}</b>\nPrecio tocó banda media $${pos.target.toFixed(2)}\nStop → BE $${pos.stop}`);
   }
-
-  // Breakeven a +3%
-  if (gainPct >= 3.0 && !pos.be) {
+  // BE dinámico por capitalización
+  const beThr = pos.entry > 300 ? 1.5 : pos.entry > 100 ? 2.0 : 3.0;
+  if (gainPct >= beThr && !pos.be) {
     pos.stop = parseFloat((pos.entry * 1.001).toFixed(2));
     pos.be   = true;
   }
-
-  // Runner EMA20 diaria
   if (pos.be && dailyBars && dailyBars.length >= 20) {
     const dCloses = dailyBars.map(b => b.c);
     const ema20   = calcEMA(dCloses, 20);
@@ -520,8 +441,6 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
       }
     }
   }
-
-  // TimeStop — 5 días sin breakeven
   if (!pos.be) {
     const days = Math.floor((new Date(date) - new Date(pos.entryDate)) / 86400000);
     if (days >= 5) {
@@ -530,30 +449,22 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
       return { close:true, exitPrice:ep, pnl, reason:'TimeStop' };
     }
   }
-
   return null;
 }
 
 async function manageShortExit(sym, pos, bar, date, dailyBars) {
   const price = bar.c, high = bar.h || price;
   if (price < (pos.minPrice || pos.entry)) pos.minPrice = price;
-
   const gainPct = (pos.entry - price) / pos.entry * 100;
-
-  // Stop
   if (high >= pos.stop) {
     const ep  = pos.stop * (1 + SLIPPAGE);
     const pnl = (pos.entry - ep) * pos.qty / EUR_USD;
     return { close:true, exitPrice:ep, pnl, reason: pos.runner ? 'RunnerStop' : 'Stop' };
   }
-
-  // Breakeven a +3%
   if (gainPct >= 3.0 && !pos.be) {
     pos.stop = parseFloat((pos.entry * 0.999).toFixed(2));
     pos.be   = true;
   }
-
-  // Runner EMA20 diaria bajista
   if (pos.be && dailyBars && dailyBars.length >= 20) {
     const dCloses = dailyBars.map(b => b.c);
     const ema20   = calcEMA(dCloses, 20);
@@ -569,8 +480,6 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
       }
     }
   }
-
-  // TimeStop
   if (!pos.be) {
     const days = Math.floor((new Date(date) - new Date(pos.entryDate)) / 86400000);
     if (days >= 5) {
@@ -579,14 +488,12 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
       return { close:true, exitPrice:ep, pnl, reason:'TimeStop' };
     }
   }
-
   return null;
 }
 
 // ═══════════════════════════════════════════════════════
 // ALPACA EXECUTION
 // ═══════════════════════════════════════════════════════
-
 function isMarketOpen() {
   const now     = new Date();
   const utcDay  = now.getUTCDay();
@@ -600,15 +507,14 @@ function isMarketOpen() {
     return Math.round((utcMins - nyMins) / 60);
   })();
   const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
-  const open    = 570 + Math.abs(nyOffset)*60;  // 9:30 NY en UTC
-  const close   = 960 + Math.abs(nyOffset)*60;  // 16:00 NY en UTC
+  const open    = 570 + Math.abs(nyOffset)*60;
+  const close   = 960 + Math.abs(nyOffset)*60;
   return utcMins >= open && utcMins < close;
 }
-
 function isEntryAllowed() {
   if (!isMarketOpen()) return false;
-  const now     = new Date();
-  const nyOffset = 4; // EDT — simplificado
+  const now      = new Date();
+  const nyOffset = 4;
   const utcMins  = now.getUTCHours()*60 + now.getUTCMinutes();
   const open     = 570 + nyOffset*60;
   const close    = 960 + nyOffset*60;
@@ -621,7 +527,6 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
     return false;
   }
   try {
-    // Orden mercado
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
       body: JSON.stringify({ symbol:sym, qty:String(qty), side:'buy',
@@ -629,20 +534,15 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
     });
     const o = await r.json();
     if (!o.id) {
-      console.log(`[EXEC] ${sym} rechazado:`, o.message || o.code);
       await sendTelegram(`❌ Error Alpaca ${sym}: ${o.message || JSON.stringify(o).slice(0,100)}`);
       return false;
     }
-
-    // Stop loss GTC
     await new Promise(r => setTimeout(r, 1500));
     await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
       body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
         type:'stop', stop_price:String(stop), time_in_force:'gtc' }),
     });
-
-    // Registrar posición
     const riskEur = Math.round((entry - stop) * qty / EUR_USD);
     openPositions[sym] = {
       sym, qty, entry, stop, entryDate: new Date().toISOString().slice(0,10),
@@ -650,39 +550,30 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
       be:false, runner:false, system: meta.system || 'MOM',
       target: meta.target || null, ts: Date.now(),
     };
-
     const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
     await sendTelegram(
-      `✅ <b>${meta.system||'MOM'} EJECUTADO — ${sym}</b>\n` +
-      `${mode}\n\n` +
+      `✅ <b>${meta.system||'MOM'} EJECUTADO — ${sym}</b>\n${mode}\n\n` +
       `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
       `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
       (meta.target ? `🎯 Target: $${meta.target.toFixed(2)}\n` : '') +
       `\n/cerrar_${sym}`
     );
-    console.log(`[EXEC] ✅ ${sym} ${qty} acc @ $${entry.toFixed(2)} stop $${stop}`);
     return true;
   } catch(e) {
-    console.error('[EXEC]', sym, e.message);
     await sendTelegram(`❌ Error ejecutando ${sym}: ${e.message}`);
     return false;
   }
 }
 
 async function executeSell(sym, qty, reason, price) {
-  if (!isMarketOpen() && !reason.toLowerCase().includes('stop')) {
-    console.log(`[BLOCKED] Venta bloqueada — mercado cerrado (${sym})`);
-    return false;
-  }
+  if (!isMarketOpen() && !reason.toLowerCase().includes('stop')) return false;
   try {
-    // Cancelar órdenes abiertas
     const openOrds = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers:alpacaHdr() }).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
         { method:'DELETE', headers:alpacaHdr() }).catch(() => {});
     }
-
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
       body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
@@ -690,11 +581,8 @@ async function executeSell(sym, qty, reason, price) {
     });
     const o = await r.json();
     if (!o.id) return false;
-
     const pos = openPositions[sym];
     const pnl = pos ? Math.round((price - pos.entry) * qty / EUR_USD) : 0;
-
-    // Guardar en historial
     if (pos) {
       tradeHistory.unshift({
         sym, system: pos.system, entry: pos.entry, exit: price,
@@ -704,67 +592,49 @@ async function executeSell(sym, qty, reason, price) {
       });
       if (tradeHistory.length > 200) tradeHistory = tradeHistory.slice(0, 200);
     }
-
     delete openPositions[sym];
     await sendTelegram(
-      `🤖 <b>AUTO-EXIT — ${sym}</b>\n` +
-      `${qty} acc @ ~$${price.toFixed(2)}\n` +
-      `Motivo: ${reason}\n` +
-      `P&L: ${pnl >= 0 ? '+' : ''}€${pnl}`
+      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ ~$${price.toFixed(2)}\n` +
+      `Motivo: ${reason}\nP&L: ${pnl >= 0 ? '+' : ''}€${pnl}`
     );
     return true;
-  } catch(e) {
-    console.error('[SELL]', sym, e.message);
-    return false;
-  }
+  } catch(e) { return false; }
 }
 
 // ═══════════════════════════════════════════════════════
 // SCANNER — MOM + BOLL
 // ═══════════════════════════════════════════════════════
-
 async function checkMOMSignals() {
   if (!isEntryAllowed()) return;
   const reg  = MARKET_REGIME;
-  if (reg.mode === 'BEAR') return;  // MOM no opera en BEAR
-
+  if (reg.mode === 'BEAR') return;
   const momCount  = Object.values(openPositions).filter(p => p.system === 'MOM').length;
   const bollCount = Object.values(openPositions).filter(p => p.system === 'BOLL').length;
   if (momCount >= MAX_MOM && bollCount >= MAX_BOLL) return;
-
   console.log(`[MOM] Modo ${reg.mode} | MOM:${momCount}/${MAX_MOM} BOLL:${bollCount}/${MAX_BOLL}`);
-
-  // Fetch SPY para RS
   const spyBars = await fetchBars15min('SPY');
   const spyLast = spyBars ? spyBars[spyBars.length-1].c : null;
   const spy20   = spyBars && spyBars.length >= 20 ? spyBars[spyBars.length-21].c : null;
-
   const candidates = [];
-
   for (const sym of UNIVERSE) {
     try {
       if (openPositions[sym]) continue;
       const month = new Date().toISOString().slice(0,7);
       if (monthlyTrades[`${sym}_${month}`]) continue;
-
       const bars15 = await fetchBars15min(sym);
       if (!bars15 || bars15.length < 50) continue;
-
-      // ── MOM signal ─────────────────────────────────
       if (momCount < MAX_MOM) {
         const sig = evalMOM(sym, bars15);
         if (sig) {
-          // Filtro sectorial
           const etf = SECTOR_MAP[sym];
           if (etf) {
             const etfBars = await fetchBars15min(etf);
             if (etfBars && etfBars.length >= 6) {
               const perf5 = (etfBars[etfBars.length-1].c - etfBars[etfBars.length-6].c)
                            / etfBars[etfBars.length-6].c * 100;
-              if (perf5 < -2.0) { continue; }
+              if (perf5 < -2.0) continue;
             }
           }
-          // RS vs SPY
           let rs = 0;
           if (spy20 && spyLast && spy20 > 0) {
             const s20 = bars15.length >= 21 ? bars15[bars15.length-21].c : null;
@@ -773,39 +643,30 @@ async function checkMOMSignals() {
           candidates.push({ ...sig, rs, type:'MOM' });
         }
       }
-
-      // ── BOLL signal (solo BULL) ────────────────────
       if (bollCount < MAX_BOLL && reg.mode === 'BULL') {
         const dailyBars = await fetchDailyBars(sym, 220);
         if (dailyBars && dailyBars.length >= 205) {
           const sig = evalBollinger(sym, dailyBars);
-          if (sig) candidates.push({ ...sig, rs:-99, type:'BOLL' }); // prioridad baja
+          if (sig) candidates.push({ ...sig, rs:-99, type:'BOLL' });
         }
       }
-
       await new Promise(r => setTimeout(r, 100));
     } catch(e) { console.log('[MOM]', sym, e.message); }
   }
-
-  // Ordenar por RS (mejor primero)
   candidates.sort((a, b) => b.rs - a.rs);
-
   for (const sig of candidates) {
     const sym = sig.sym;
     if (openPositions[sym]) continue;
-
     const entry   = sig.last * (1 + SLIPPAGE);
     const atrVal  = Math.max(sig.atr, sig.last * 0.005);
     const stop    = parseFloat((entry - atrVal * 1.5).toFixed(2));
     const qty     = calcQty(entry, stop, reg.sizeMult);
     if (!qty) continue;
-
     const target = sig.type === 'BOLL' ? sig.target : null;
     const month  = new Date().toISOString().slice(0,7);
     const key    = `${sym}_mom_${Math.floor(Date.now()/(4*3600*1000))}`;
     if (sentAlerts[key]) continue;
     sentAlerts[key] = Date.now();
-
     if (AUTO_EXECUTE) {
       await executeBuy(sym, entry, stop, qty, { system: sig.type, target });
       monthlyTrades[`${sym}_${month}`] = true;
@@ -825,72 +686,54 @@ async function checkMOMSignals() {
 }
 
 // ═══════════════════════════════════════════════════════
-// SCANNER — SHORT v3
+// SCANNER — SHORT
 // ═══════════════════════════════════════════════════════
-
 async function checkShortSignals() {
   if (!isEntryAllowed()) return;
   const reg = MARKET_REGIME;
-  if (reg.mode !== 'BEAR')          return;
+  if (reg.mode !== 'BEAR')            return;
   if (reg.bearStreak < BEAR_MIN_DAYS) return;
-  if (!reg.sma50Bearish)             return;
-
+  if (!reg.sma50Bearish)              return;
   const shortCount = Object.values(openPositions).filter(p => p.system === 'SHORT').length;
   if (shortCount >= MAX_SHORT) return;
-
-  console.log(`[SHORT] Modo BEAR bearStreak:${reg.bearStreak} | SHORT:${shortCount}/${MAX_SHORT}`);
-
+  console.log(`[SHORT] BEAR bearStreak:${reg.bearStreak} | SHORT:${shortCount}/${MAX_SHORT}`);
   const spyBars = await fetchBars15min('SPY');
   const spyLast = spyBars ? spyBars[spyBars.length-1].c : null;
   const spy20   = spyBars && spyBars.length >= 21 ? spyBars[spyBars.length-21].c : null;
-
   const candidates = [];
-
   for (const sym of UNIVERSE) {
     try {
       if (openPositions[sym]) continue;
       const month = new Date().toISOString().slice(0,7);
       if (monthlyTrades[`${sym}_short_${month}`]) continue;
-
       const bars15 = await fetchBars15min(sym);
       if (!bars15 || bars15.length < 50) continue;
-
-      // RS vs SPY
       let spyRS = null;
       if (spy20 && spyLast && spy20 > 0) {
         const s20 = bars15.length >= 21 ? bars15[bars15.length-21].c : null;
         if (s20 && s20 > 0) spyRS = (bars15[bars15.length-1].c/s20-1)*100 - (spyLast/spy20-1)*100;
       }
-
       const sig = evalShort(sym, bars15, spyRS);
       if (sig) candidates.push({ ...sig, spyRS });
-
       await new Promise(r => setTimeout(r, 100));
     } catch(e) { console.log('[SHORT]', sym, e.message); }
   }
-
-  // Ordenar por RS más negativa (más bajista primero)
   candidates.sort((a, b) => a.spyRS - b.spyRS);
-
   for (const sig of candidates) {
     const sym = sig.sym;
     if (openPositions[sym]) continue;
     const shortNow = Object.values(openPositions).filter(p=>p.system==='SHORT').length;
     if (shortNow >= MAX_SHORT) break;
-
     const entry  = sig.last * (1 - SLIPPAGE);
     const atrVal = Math.max(sig.atr, sig.last * 0.005);
     const stop   = parseFloat((entry + atrVal * 1.5).toFixed(2));
     const qty    = calcQty(entry, stop);
     if (!qty) continue;
-
     const month = new Date().toISOString().slice(0,7);
     const key   = `${sym}_short_${Math.floor(Date.now()/(4*3600*1000))}`;
     if (sentAlerts[key]) continue;
     sentAlerts[key] = Date.now();
-
     if (AUTO_EXECUTE) {
-      // SHORT — orden de venta en corto
       try {
         const r = await fetch(`${alpacaBase()}/v2/orders`, {
           method:'POST', headers:alpacaHdr(),
@@ -908,8 +751,7 @@ async function checkShortSignals() {
             `📉 <b>SHORT EJECUTADO — ${sym}</b>\n\n` +
             `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
             `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
-            `📊 RSI ${sig.rsi} | RS ${sig.spyRS?.toFixed(1)}% vs SPY\n` +
-            `\n/cerrar_${sym}`
+            `📊 RSI ${sig.rsi} | RS ${sig.spyRS?.toFixed(1)}% vs SPY\n\n/cerrar_${sym}`
           );
         }
       } catch(e) { console.log('[SHORT EXEC]', sym, e.message); }
@@ -928,76 +770,57 @@ async function checkShortSignals() {
 // ═══════════════════════════════════════════════════════
 // GESTIÓN POSICIONES ABIERTAS
 // ═══════════════════════════════════════════════════════
-
 async function managePositions() {
   const syms = Object.keys(openPositions);
   if (!syms.length) return;
-
   for (const sym of syms) {
     try {
       const pos  = openPositions[sym];
       if (!pos) continue;
-
       const snap = await fetchSnapshot(sym);
       if (!snap) continue;
       const price = snap.price;
       const date  = new Date().toISOString().slice(0,10);
-
-      // Barras para el runner
       const dailyBars = await fetchDailyBars(sym, 30);
-
-      // Crear bar mock para la función de gestión
       const bar = { c: price, h: price * 1.001, l: price * 0.999 };
-
       let result = null;
       if (pos.system === 'SHORT') {
         result = await manageShortExit(sym, pos, bar, date, dailyBars);
       } else {
         result = await manageLongExit(sym, pos, bar, date, dailyBars);
       }
-
       if (result && result.close) {
-        const isShort = pos.system === 'SHORT';
-        const sold = await executeSell(sym, pos.qty, result.reason, result.exitPrice);
-        if (sold) {
-          console.log(`[EXIT] ${sym} ${result.reason} pnl €${Math.round(result.pnl)}`);
-        }
+        await executeSell(sym, pos.qty, result.reason, result.exitPrice);
       }
-
       // Alertas de hitos
       const gainPct = pos.system === 'SHORT'
         ? (pos.entry - price) / pos.entry * 100
         : (price - pos.entry) / pos.entry * 100;
-
-      for (const m of [3, 5, 10, 15]) {
-        const mk = `${sym}_hito_${m}`;
-        if (gainPct >= m && !sentAlerts[mk]) {
+      for (const mh of [3, 5, 10, 15]) {
+        const mk = `${sym}_hito_${mh}`;
+        if (gainPct >= mh && !sentAlerts[mk]) {
           sentAlerts[mk] = Date.now();
           const pnl = Math.round(Math.abs(price - pos.entry) * pos.qty / EUR_USD);
           await sendTelegram(`📈 <b>${pos.system} ${sym} +${gainPct.toFixed(1)}%</b>\n$${price.toFixed(2)} · P&L: +€${pnl}\nStop: $${pos.stop}`);
         }
       }
-
       await new Promise(r => setTimeout(r, 300));
     } catch(e) { console.log('[MANAGE]', sym, e.message); }
   }
 }
 
 // ═══════════════════════════════════════════════════════
-// SECTOR SENTIMENT — Claude análisis diario
+// SECTOR SENTIMENT
 // ═══════════════════════════════════════════════════════
-
 const SECTOR_ETFS = {
-  AI_CHIPS:   'SOXX', CLOUD:'XLK', SPACE:'XAR',
+  AI_CHIPS:'SOXX', CLOUD:'XLK', SPACE:'XAR',
   CLEAN_ENERGY:'ICLN', BIOTECH:'XBI', HEALTHCARE:'XLV',
   AIRLINES:'JETS', INDUSTRIAL:'XLI', FINTECH:'XLF',
 };
-
 async function updateSectorSentiment() {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return;
-
     const etfData = {};
     for (const [sector, etf] of Object.entries(SECTOR_ETFS)) {
       const bars = await fetchDailyBars(etf, 30);
@@ -1007,17 +830,14 @@ async function updateSectorSentiment() {
       const perf5d = (last - closes[closes.length-6]) / closes[closes.length-6] * 100;
       etfData[sector] = { etf, perf5d: parseFloat(perf5d.toFixed(2)), last };
     }
-
     const etfText = Object.entries(etfData).map(([s,d]) =>
       `${s}(${d.etf}): ${d.perf5d>0?'+':''}${d.perf5d}% 5d`
     ).join('\n');
-
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method:'POST',
       headers:{ 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1000,
+        model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
         system: 'Responde SOLO con JSON válido. Sin markdown.',
         messages: [{ role:'user', content:
           `ETFs sectoriales hoy:\n${etfText}\n\n` +
@@ -1035,9 +855,7 @@ async function updateSectorSentiment() {
       sectorLastUpdate = new Date().toISOString().slice(0,10);
       const bull = Object.entries(sectorSentiment).filter(([,v])=>v.status==='BULLISH').map(([k])=>k);
       const bear = Object.entries(sectorSentiment).filter(([,v])=>v.status==='BEARISH').map(([k])=>k);
-      await sendTelegram(
-        `📊 <b>Análisis Sectorial</b>\n🟢 ${bull.join(', ')||'ninguno'}\n🔴 ${bear.join(', ')||'ninguno'}`
-      );
+      await sendTelegram(`📊 <b>Análisis Sectorial</b>\n🟢 ${bull.join(', ')||'ninguno'}\n🔴 ${bear.join(', ')||'ninguno'}`);
     }
   } catch(e) { console.log('[SECTOR]', e.message); }
 }
@@ -1045,7 +863,6 @@ async function updateSectorSentiment() {
 // ═══════════════════════════════════════════════════════
 // TELEGRAM
 // ═══════════════════════════════════════════════════════
-
 async function sendTelegram(msg) {
   if (!TG_TOKEN || !TG_CHAT) return false;
   try {
@@ -1055,7 +872,7 @@ async function sendTelegram(msg) {
     });
     const d = await r.json();
     return d.ok;
-  } catch(e) { console.log('[TG]', e.message); return false; }
+  } catch(e) { return false; }
 }
 
 async function pollTelegram() {
@@ -1063,16 +880,13 @@ async function pollTelegram() {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId+1}&timeout=5`);
     const d = await r.json();
     if (!d.ok || !d.result.length) return;
-
     for (const update of d.result) {
       lastUpdateId = update.update_id;
       const msg  = update.message;
       if (!msg?.text) continue;
       const text = msg.text.trim().toLowerCase();
       if (msg.chat.id.toString() !== TG_CHAT) continue;
-
       console.log(`[TG CMD] ${text}`);
-
       if (text === '/si' || text.startsWith('/ejecutar_')) {
         const sym = text.startsWith('/ejecutar_')
           ? text.replace('/ejecutar_','').toUpperCase()
@@ -1081,12 +895,11 @@ async function pollTelegram() {
         const order = pendingOrders[sym];
         if (Date.now() - order.ts > 10*60*1000) {
           delete pendingOrders[sym];
-          await sendTelegram(`⏰ Orden ${sym} expirada — señal puede haber cambiado`);
+          await sendTelegram(`⏰ Orden ${sym} expirada`);
           continue;
         }
         if (!isMarketOpen()) { await sendTelegram('🚫 Mercado cerrado'); continue; }
         if (order.isShort) {
-          // Ejecutar short
           const r2 = await fetch(`${alpacaBase()}/v2/orders`, {
             method:'POST', headers:alpacaHdr(),
             body: JSON.stringify({ symbol:sym, qty:String(order.qty), side:'sell',
@@ -1109,14 +922,12 @@ async function pollTelegram() {
           delete pendingOrders[sym];
         }
       }
-
       else if (text === '/no' || text.startsWith('/cancelar_')) {
         const sym = text.startsWith('/cancelar_')
           ? text.replace('/cancelar_','').toUpperCase()
           : Object.keys(pendingOrders)[0];
         if (sym && pendingOrders[sym]) { delete pendingOrders[sym]; await sendTelegram(`❌ ${sym} cancelado`); }
       }
-
       else if (text.startsWith('/cerrar_')) {
         const sym = text.replace('/cerrar_','').toUpperCase();
         const pos = openPositions[sym];
@@ -1125,47 +936,57 @@ async function pollTelegram() {
         const price = snap?.price || pos.entry;
         await executeSell(sym, pos.qty, 'Manual', price);
       }
-
       else if (text === '/posiciones') {
         const syms = Object.keys(openPositions);
         if (!syms.length) { await sendTelegram('📊 Sin posiciones abiertas'); continue; }
         let m = `💼 <b>POSICIONES (${syms.length})</b>\n\n`;
         for (const s of syms) {
-          const p   = openPositions[s];
-          const snap= await fetchSnapshot(s).catch(()=>null);
-          const px  = snap?.price || p.entry;
-          const pct = p.system === 'SHORT'
+          const p    = openPositions[s];
+          const snap = await fetchSnapshot(s).catch(()=>null);
+          const px   = snap?.price || p.entry;
+          const pct  = p.system === 'SHORT'
             ? ((p.entry - px)/p.entry*100).toFixed(1)
             : ((px - p.entry)/p.entry*100).toFixed(1);
-          const pnl = Math.round(Math.abs(px - p.entry) * p.qty / EUR_USD);
-          const icon= parseFloat(pct)>=0 ? '🟢' : '🔴';
-          m += `<b>${s}</b> [${p.system}] ${icon} ${pct>=0?'+':''}${pct}%\n`;
+          const pnl  = Math.round(Math.abs(px - p.entry) * p.qty / EUR_USD);
+          const icon = parseFloat(pct)>=0 ? '🟢' : '🔴';
+          m += `<b>${s}</b> [${p.system}] ${icon} ${parseFloat(pct)>=0?'+':''}${pct}%\n`;
           m += `$${p.entry}→$${px.toFixed(2)} · Stop $${p.stop} · P&L: ${parseFloat(pct)>=0?'+':''}€${pnl}\n\n`;
         }
         await sendTelegram(m);
       }
-
       else if (text === '/estado') {
         const reg = MARKET_REGIME;
-        const m =
-          `⚙️ <b>Estado V3</b>\n\n` +
+        await sendTelegram(
+          `⚙️ <b>Estado V3.1</b>\n\n` +
           `🏛️ Régimen: <b>${reg.mode}</b>\n` +
           `SPY $${reg.price?.toFixed(2)||'—'} | SMA50 $${reg.sma50||'—'}\n` +
-          `bearStreak: ${reg.bearStreak} | sma50Bear: ${reg.sma50Bearish}\n\n` +
-          `💼 Cuenta: ${getAcc().label}\n` +
+          `bearStreak: ${reg.bearStreak}\n\n` +
           `💰 Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
           `📊 Posiciones: ${Object.keys(openPositions).length}\n` +
-          `🤖 AUTO_EXECUTE: ${AUTO_EXECUTE}\n\n` +
-          `Sistemas:\n` +
-          `  MOM: ${Object.values(openPositions).filter(p=>p.system==='MOM').length}/${MAX_MOM}\n` +
-          `  BOLL: ${Object.values(openPositions).filter(p=>p.system==='BOLL').length}/${MAX_BOLL}\n` +
-          `  SHORT: ${Object.values(openPositions).filter(p=>p.system==='SHORT').length}/${MAX_SHORT}`;
-        await sendTelegram(m);
+          `🤖 AUTO: ${AUTO_EXECUTE}\n\n` +
+          `MOM: ${Object.values(openPositions).filter(p=>p.system==='MOM').length}/${MAX_MOM}\n` +
+          `BOLL: ${Object.values(openPositions).filter(p=>p.system==='BOLL').length}/${MAX_BOLL}\n` +
+          `SHORT: ${Object.values(openPositions).filter(p=>p.system==='SHORT').length}/${MAX_SHORT}`
+        );
       }
-
+      else if (text === '/trades') {
+        const wins = tradeHistory.filter(t=>t.win);
+        const gl   = Math.abs(tradeHistory.filter(t=>!t.win).reduce((s,t)=>s+(t.pnlEur||0),0));
+        const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
+        const wr   = tradeHistory.length ? Math.round(wins.length/tradeHistory.length*100) : 0;
+        const pf   = gl>0 ? (gw/gl).toFixed(2) : '∞';
+        await sendTelegram(
+          `📈 <b>Historial (${tradeHistory.length} trades)</b>\n\n` +
+          `WR: ${wr}% | PF: ${pf}\n` +
+          `P&L: €${Math.round(gw-gl)>=0?'+':''}${Math.round(gw-gl)}\n\n` +
+          tradeHistory.slice(0,8).map(t=>
+            `${t.win?'✅':'❌'} ${t.sym} [${t.system}] €${t.pnlEur>=0?'+':''}${t.pnlEur} (${t.exitReason})`
+          ).join('\n')
+        );
+      }
       else if (text === '/ayuda' || text === '/help') {
         await sendTelegram(
-          `🤖 <b>ORS V3</b>\n\n` +
+          `🤖 <b>ORS V3.1</b>\n\n` +
           `<b>ÓRDENES</b>\n` +
           `/si — Confirmar última orden\n` +
           `/no — Cancelar última orden\n` +
@@ -1175,10 +996,10 @@ async function pollTelegram() {
           `<b>INFO</b>\n` +
           `/posiciones — Ver posiciones y P&L\n` +
           `/estado — Estado del servidor\n` +
+          `/trades — Historial de trades\n` +
           `/ayuda — Este menú`
         );
       }
-
       else if (text.startsWith('/capital')) {
         const parts = text.split(' ');
         const newCap = parseFloat(parts[1]);
@@ -1196,9 +1017,8 @@ async function pollTelegram() {
 // ═══════════════════════════════════════════════════════
 // RUTAS API
 // ═══════════════════════════════════════════════════════
-
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3', version: '3.0.0',
+  status: 'ORS V3.1', version: '3.1.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1206,7 +1026,7 @@ app.get('/', (req, res) => res.json({
 }));
 
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.0.0',
+  status: 'ok', version: '3.1.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1218,36 +1038,32 @@ app.get('/health', (req, res) => res.json({
   autoExecute: AUTO_EXECUTE,
 }));
 
-app.get('/regime', (req, res) => res.json(MARKET_REGIME));
-
+app.get('/regime',    (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
 
 app.get('/trades', (req, res) => {
-  const wins   = tradeHistory.filter(t=>t.win);
-  const losses = tradeHistory.filter(t=>!t.win);
-  const gw = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
-  const gl = Math.abs(losses.reduce((s,t)=>s+(t.pnlEur||0),0));
+  const wins = tradeHistory.filter(t=>t.win);
+  const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
+  const gl   = Math.abs(tradeHistory.filter(t=>!t.win).reduce((s,t)=>s+(t.pnlEur||0),0));
   res.json({
-    summary: {
-      n: tradeHistory.length,
+    summary: { n:tradeHistory.length,
       wr: tradeHistory.length ? Math.round(wins.length/tradeHistory.length*100) : 0,
-      pf: gl > 0 ? parseFloat((gw/gl).toFixed(2)) : 0,
-      pnl: Math.round(gw - gl),
-    },
-    trades: tradeHistory.slice(0, 50),
+      pf: gl>0 ? parseFloat((gw/gl).toFixed(2)) : 0,
+      pnl: Math.round(gw-gl) },
+    trades: tradeHistory.slice(0,50),
   });
 });
 
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
-    const wins = trades.filter(t=>t.win);
-    const loses= trades.filter(t=>!t.win);
+    const wins  = trades.filter(t=>t.win);
+    const loses = trades.filter(t=>!t.win);
     const gw = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
     const gl = Math.abs(loses.reduce((s,t)=>s+(t.pnlEur||0),0));
     return { n:trades.length, wins:wins.length, losses:loses.length,
       wr: trades.length ? parseFloat((wins.length/trades.length*100).toFixed(1)) : 0,
-      pf: gl > 0 ? parseFloat((gw/gl).toFixed(2)) : 0,
-      pnl: Math.round(gw - gl) };
+      pf: gl>0 ? parseFloat((gw/gl).toFixed(2)) : 0,
+      pnl: Math.round(gw-gl) };
   }
   res.json({
     MOM:   stats(tradeHistory.filter(t=>t.system==='MOM')),
@@ -1258,16 +1074,142 @@ app.get('/trades/stats/strategy', (req, res) => {
 });
 
 app.get('/sector/sentiment', (req, res) => res.json({
-  lastUpdate: sectorLastUpdate,
-  sentiment:  sectorSentiment,
+  lastUpdate: sectorLastUpdate, sentiment: sectorSentiment,
 }));
-
 app.post('/sector/run', async (req, res) => {
-  res.json({ ok:true, message:'Análisis sectorial iniciado' });
+  res.json({ ok:true });
   updateSectorSentiment().catch(e => console.log('[SECTOR]', e.message));
 });
 
-// Proxy Claude
+// ── SYNC POSICIONES ───────────────────────────────────
+app.get('/sync', async (req, res) => {
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
+    const alpacaPositions = await r.json();
+    res.json({
+      alpaca: Array.isArray(alpacaPositions) ? alpacaPositions.map(p => ({
+        sym: p.symbol, side: p.side, qty: p.qty,
+        entry: p.avg_entry_price, current: p.current_price, pnl: p.unrealized_pl,
+      })) : [],
+      server: Object.keys(openPositions),
+      missing: Array.isArray(alpacaPositions)
+        ? alpacaPositions.filter(p => !openPositions[p.symbol]).map(p => p.symbol)
+        : [],
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/sync', async (req, res) => {
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
+    const positions = await r.json();
+    if (!Array.isArray(positions))
+      return res.status(500).json({ error: 'Error Alpaca', raw: positions });
+    const synced = [], skipped = [];
+    for (const p of positions) {
+      const sym = p.symbol;
+      if (openPositions[sym]) { skipped.push(sym); continue; }
+      const ep   = parseFloat(p.avg_entry_price);
+      const qty  = Math.abs(parseInt(p.qty));
+      const side = p.side;
+      const system = side === 'short' ? 'SHORT' : 'MOM';
+      const stop = side === 'short'
+        ? parseFloat((ep * 1.03).toFixed(2))
+        : parseFloat((ep * 0.97).toFixed(2));
+      openPositions[sym] = {
+        sym, qty, entry: ep, stop,
+        entryDate: new Date().toISOString().slice(0,10),
+        maxPrice: ep, minPrice: ep,
+        be: false, runner: false, system, ts: Date.now(), synced: true,
+      };
+      synced.push({ sym, side, qty, entry: ep, stop, system });
+    }
+    if (synced.length > 0) {
+      await sendTelegram(
+        `📊 <b>Posiciones sincronizadas</b>\n\n` +
+        synced.map(p =>
+          `${p.system==='SHORT'?'📉':'📈'} <b>${p.sym}</b> ${p.qty}acc @ $${p.entry.toFixed(2)}\nStop: $${p.stop}`
+        ).join('\n\n')
+      );
+    }
+    res.json({ ok:true, synced:synced.length, skipped:skipped.length,
+      positions:synced, total_open:Object.keys(openPositions).length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SYNC HISTORIAL ────────────────────────────────────
+app.get('/sync/history', (req, res) => {
+  const wins = tradeHistory.filter(t=>t.win);
+  const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
+  const gl   = Math.abs(tradeHistory.filter(t=>!t.win).reduce((s,t)=>s+(t.pnlEur||0),0));
+  res.json({
+    total: tradeHistory.length,
+    wr: tradeHistory.length ? Math.round(wins.length/tradeHistory.length*100) : 0,
+    pf: gl>0 ? parseFloat((gw/gl).toFixed(2)) : 0,
+    pnl: Math.round(gw-gl),
+    trades: tradeHistory.slice(0,50),
+  });
+});
+
+app.post('/sync/history', async (req, res) => {
+  try {
+    const days  = parseInt(req.query.days || '7');
+    const after = new Date(Date.now() - days*24*3600*1000).toISOString().slice(0,10);
+    const r = await fetch(
+      `${alpacaBase()}/v2/orders?status=closed&after=${after}&limit=200&direction=desc`,
+      { headers: alpacaHdr() }
+    );
+    const orders = await r.json();
+    if (!Array.isArray(orders))
+      return res.status(500).json({ error: 'Error Alpaca orders', raw: orders });
+    const filled = orders.filter(o => o.status === 'filled');
+    const bySymbol = {};
+    for (const o of filled) {
+      const sym = o.symbol;
+      if (!bySymbol[sym]) bySymbol[sym] = [];
+      bySymbol[sym].push({
+        side: o.side, qty: parseFloat(o.filled_qty||o.qty),
+        price: parseFloat(o.filled_avg_price||0),
+        time: o.filled_at||o.created_at, type: o.type,
+      });
+    }
+    const trades = [];
+    for (const [sym, ords] of Object.entries(bySymbol)) {
+      const buys  = ords.filter(o=>o.side==='buy').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      const sells = ords.filter(o=>o.side==='sell').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      for (let i=0; i<Math.min(buys.length,sells.length); i++) {
+        const buy=buys[i], sell=sells[i];
+        if (new Date(sell.time)>new Date(buy.time)) {
+          const pnlEur = Math.round((sell.price-buy.price)*buy.qty/EUR_USD);
+          const trade  = { sym, system:'MOM', entry:buy.price, exit:sell.price,
+            qty:buy.qty, pnlEur, win:pnlEur>0,
+            entryDate:buy.time.slice(0,10), exitDate:sell.time.slice(0,10),
+            exitReason: sell.type==='stop'?'Stop':'Manual', synced:true };
+          const exists = tradeHistory.some(t=>t.sym===sym&&t.entryDate===trade.entryDate&&t.exitDate===trade.exitDate);
+          if (!exists) { tradeHistory.unshift(trade); trades.push(trade); }
+        }
+      }
+    }
+    tradeHistory.sort((a,b)=>new Date(b.exitDate)-new Date(a.exitDate));
+    if (tradeHistory.length>200) tradeHistory=tradeHistory.slice(0,200);
+    const wins  = trades.filter(t=>t.win);
+    const pnl   = trades.reduce((s,t)=>s+t.pnlEur,0);
+    await sendTelegram(
+      `📚 <b>Historial sincronizado</b>\n\nTrades recuperados: ${trades.length}\n` +
+      `Ganadores: ${wins.length} | Perdedores: ${trades.length-wins.length}\n` +
+      `P&L: €${pnl>=0?'+':''}${pnl}\n\n` +
+      trades.slice(0,5).map(t=>
+        `${t.win?'✅':'❌'} ${t.sym} [${t.system}] €${t.pnlEur>=0?'+':''}${t.pnlEur} (${t.exitReason})`
+      ).join('\n')
+    );
+    res.json({ ok:true, recovered:trades.length, total_history:tradeHistory.length,
+      summary:{wins:wins.length,losses:trades.length-wins.length,pnl}, trades });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PROXY CLAUDE ──────────────────────────────────────
 app.post('/claude', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error:'ANTHROPIC_API_KEY no configurada' });
@@ -1281,7 +1223,7 @@ app.post('/claude', async (req, res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// Yahoo proxy
+// ── YAHOO PROXY ───────────────────────────────────────
 app.get('/yahoo', async (req, res) => {
   const { sym, range='2y', interval='1d' } = req.query;
   if (!sym) return res.status(400).json({ error:'sym required' });
@@ -1294,7 +1236,7 @@ app.get('/yahoo', async (req, res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-// Alpaca pass-through
+// ── ALPACA PASS-THROUGH ───────────────────────────────
 app.get('/alpaca/account',   async (req, res) => {
   const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
   res.json(await r.json());
@@ -1313,83 +1255,77 @@ app.get('/alpaca/snapshots', async (req, res) => {
 // ═══════════════════════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
-
 app.listen(PORT, async () => {
   console.log(`ORS V3 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
-
   await sendTelegram(
-    `🚀 <b>ORS V3 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.1 arrancado</b>\n\n` +
     `BULL:    MOM (4) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
     `Cuenta: ${getAcc().label}\n` +
     `Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
-    `Auto: ${AUTO_EXECUTE}`
+    `Auto: ${AUTO_EXECUTE}\n` +
+    `BE: dinámico por capitalización`
   );
-
   // Régimen al arrancar
   setTimeout(updateRegime, 3000);
-
-  // Sync posiciones Alpaca
+  // Sync posiciones Alpaca al arrancar
   setTimeout(async () => {
     try {
       const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
       const positions = await r.json();
       if (Array.isArray(positions) && positions.length) {
+        const synced = [];
         positions.forEach(p => {
           if (!openPositions[p.symbol]) {
-            const ep = parseFloat(p.avg_entry_price);
+            const ep   = parseFloat(p.avg_entry_price);
+            const side = p.side;
+            const system = side === 'short' ? 'SHORT' : 'MOM';
+            const stop = side === 'short'
+              ? parseFloat((ep*1.03).toFixed(2))
+              : parseFloat((ep*0.97).toFixed(2));
             openPositions[p.symbol] = {
-              sym:p.symbol, qty:parseInt(p.qty), entry:ep,
-              stop: parseFloat((ep*0.97).toFixed(2)),
+              sym:p.symbol, qty:Math.abs(parseInt(p.qty)), entry:ep, stop,
               entryDate: new Date().toISOString().slice(0,10),
-              maxPrice:ep, be:false, runner:false, system:'MOM', ts:Date.now(),
+              maxPrice:ep, minPrice:ep, be:false, runner:false,
+              system, ts:Date.now(), synced:true,
             };
+            synced.push(p.symbol);
           }
         });
-        console.log(`[SYNC] ${positions.length} posiciones cargadas`);
-        await sendTelegram(`📊 Posiciones sincronizadas: ${positions.map(p=>p.symbol).join(', ')}`);
+        if (synced.length) {
+          console.log(`[SYNC] ${synced.length} posiciones: ${synced.join(', ')}`);
+          await sendTelegram(`📊 <b>Posiciones al arrancar:</b> ${synced.join(', ')}`);
+        }
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
 
   // Schedulers
-  setInterval(checkMOMSignals,    5 * 60 * 1000);   // cada 5 min
-  setInterval(checkShortSignals,  5 * 60 * 1000);   // cada 5 min (solo en BEAR)
-  setInterval(managePositions,    3 * 60 * 1000);   // cada 3 min
-  setInterval(pollTelegram,       3 * 1000);         // cada 3 seg
-  setInterval(updateRegime,       60 * 60 * 1000);  // cada hora
-
-  // Primera señal 30s tras arranque
-  setTimeout(checkMOMSignals,  30 * 1000);
-  setTimeout(checkShortSignals,35 * 1000);
+  setInterval(checkMOMSignals,   5*60*1000);
+  setInterval(checkShortSignals, 5*60*1000);
+  setInterval(managePositions,   3*60*1000);
+  setInterval(pollTelegram,      3*1000);
+  setInterval(updateRegime,      60*60*1000);
+  setTimeout(checkMOMSignals,    30*1000);
+  setTimeout(checkShortSignals,  35*1000);
 
   // Sector sentiment al cierre (20:15 UTC)
   function scheduleSector() {
     const now    = new Date();
-    const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(),
-                            now.getUTCDate(), 20, 15, 0));
-    if (now >= target) target.setUTCDate(target.getUTCDate() + 1);
-    const ms = target - now;
-    setTimeout(async () => {
-      await updateSectorSentiment();
-      scheduleSector();
-    }, ms);
+    const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
+    if (now>=target) target.setUTCDate(target.getUTCDate()+1);
+    setTimeout(async()=>{ await updateSectorSentiment(); scheduleSector(); }, target-now);
   }
   scheduleSector();
 
-  // Régimen al cierre del mercado (20:05 UTC)
+  // Régimen al cierre (20:05 UTC)
   function scheduleRegime() {
     const now    = new Date();
-    const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(),
-                            now.getUTCDate(), 20, 5, 0));
-    if (now >= target) target.setUTCDate(target.getUTCDate() + 1);
-    const ms = target - now;
-    setTimeout(async () => {
-      await updateRegime();
-      scheduleRegime();
-    }, ms);
+    const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,5,0));
+    if (now>=target) target.setUTCDate(target.getUTCDate()+1);
+    setTimeout(async()=>{ await updateRegime(); scheduleRegime(); }, target-now);
   }
   scheduleRegime();
 });
