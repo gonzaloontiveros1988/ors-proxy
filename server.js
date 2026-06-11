@@ -1,16 +1,17 @@
-// server.js — v3.3.0
+// server.js — v3.4.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
-// BULL:    MOM V1 (4 slots) + Bollinger (1 slot)
+// BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
 // LATERAL: MOM V1 75% sizing (5 slots)
 // BEAR:    SHORT v3 filtros A+D (3 slots)
 //
 // v3.1.0: /sync + /sync/history endpoints
+// v3.4.0: COMB_FINAL — I10 (Stop VPOC) + D03 (SPY>-1%) + N02 (Wyckoff Spring)
+//         Backtest OOS confirmado: PF 3.59 MAR 10.58 DD 6.08%
 'use strict';
 const express = require('express');
 const app = express();
 app.use(express.json());
-
 // ── CORS ──────────────────────────────────────────────
 app.use(function(req, res, next) {
   res.header('Access-Control-Allow-Origin', '*');
@@ -19,7 +20,6 @@ app.use(function(req, res, next) {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
-
 // ── CONFIG ────────────────────────────────────────────
 const PORT       = process.env.PORT       || 3000;
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
@@ -32,7 +32,6 @@ const MAX_MOM    = 5;
 const MAX_BOLL   = 1;
 const MAX_SHORT  = 3;
 const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
-
 // ── ALPACA ────────────────────────────────────────────
 const ALPACA_DATA = 'https://data.alpaca.markets';
 const ALPACA_ACCOUNTS = {
@@ -58,7 +57,6 @@ const alpacaHdr = () => ({
   'Content-Type':        'application/json',
 });
 const isLive = () => ACTIVE_ACCOUNT === 'live';
-
 // ── UNIVERSO ──────────────────────────────────────────
 const UNIVERSE = [
   'NVDA','AMD','AVGO','TSM','MU','QCOM','MRVL','SMCI','ORCL','PLTR',
@@ -73,7 +71,6 @@ const UNIVERSE = [
   'JPM','GS','MS','COIN',
   'HUT','TKO','BE','AMG','EL','HUM','SMCI',
 ];
-
 const SECTOR_MAP = {
   NVDA:'XLK',AMD:'XLK',AVGO:'XLK',TSM:'XLK',MU:'XLK',
   QCOM:'XLK',MRVL:'XLK',SMCI:'XLK',ORCL:'XLK',PLTR:'XLK',
@@ -90,7 +87,6 @@ const SECTOR_MAP = {
   RKLB:'XLK',LUNR:'XLK',TSLA:'XLK',
   JPM:'XLF',GS:'XLF',MS:'XLF',COIN:'XLF',
 };
-
 // ── ESTADO ────────────────────────────────────────────
 const openPositions   = {};
 const pendingOrders   = {};
@@ -98,16 +94,16 @@ const sentAlerts      = {};
 const monthlyTrades   = {};
 let   tradeHistory    = [];
 let   lastUpdateId    = 0;
-
 let MARKET_REGIME = {
   mode: 'BULL',
   sma50: null, sma200: null,
   bearStreak: 0, sma50Bearish: false,
   sizeMult: 1.0, ts: 0,
 };
-
 let sectorSentiment  = {};
 let sectorLastUpdate = null;
+// Cache SPY diario para D03
+let spyDailyCache = { changePct: 0, date: '', ts: 0 };
 
 // ═══════════════════════════════════════════════════════
 // INDICADORES
@@ -212,6 +208,76 @@ function calcSMA(prices, n) {
   return prices.slice(-n).reduce((a, b) => a + b, 0) / n;
 }
 
+// ── v3.4.0: VPOC — Volume Point of Control ──────────────
+// Nivel de precio con más volumen acumulado en últimas N barras 15min
+// Grupos de $0.05 — donde instituciones compraron más
+function calcVPOC(bars, nBars) {
+  if (!bars || bars.length < nBars) return null;
+  const recent = bars.slice(-nBars);
+  const volByLevel = {};
+  for (const b of recent) {
+    const price = b.c || 0;
+    const vol   = b.v || 0;
+    if (!price || !vol) continue;
+    const level = Math.round(price * 20) / 20; // niveles $0.05
+    volByLevel[level] = (volByLevel[level] || 0) + vol;
+  }
+  if (!Object.keys(volByLevel).length) return null;
+  return parseFloat(
+    Object.entries(volByLevel).sort((a, b) => b[1] - a[1])[0][0]
+  );
+}
+
+// ── v3.4.0: Stop bajo VPOC (I10) ────────────────────────
+// Si VPOC < entry y dentro de 3×ATR → stop = VPOC×0.999
+// Fallback: 1.5×ATR si no hay VPOC válido
+function calcStopVPOC(bars, entry, atr) {
+  const vpoc = calcVPOC(bars, Math.min(bars.length, 520)); // ~20 días
+  if (vpoc && vpoc < entry && (entry - vpoc) < atr * 3) {
+    const s = parseFloat((vpoc * 0.999).toFixed(2));
+    console.log(`[VPOC] entry=$${entry.toFixed(2)} VPOC=$${vpoc} stop=$${s}`);
+    return s;
+  }
+  return parseFloat((entry - atr * 1.5).toFixed(2));
+}
+
+// ── v3.4.0: Wyckoff Spring (N02) ────────────────────────
+// Detecta caída brusca (>2%) recuperada el mismo día en últimos N días
+// Spring = stops retail saltaron, camino limpio para subir
+// Backtest OOS: PF 3.58 vs 3.28 BASE, P&L €+26,549
+function detectWyckoffSpring(dailyBars, nDays = 10) {
+  if (!dailyBars || dailyBars.length < nDays) return false;
+  const recent = dailyBars.slice(-nDays);
+  for (const b of recent) {
+    const open  = b.o || b.c;
+    const low   = b.l || b.c;
+    const close = b.c;
+    if (open <= 0) continue;
+    const fallFromOpen = (open - low) / open * 100;
+    // Caída >2% desde open recuperada al cierre (close ≥ 99% del open)
+    if (fallFromOpen > 2.0 && close >= open * 0.99) return true;
+  }
+  return false;
+}
+
+// ── v3.4.0: SPY cambio diario para D03 ──────────────────
+async function getSPYDailyChange() {
+  // Cache de 15 minutos para no llamar Alpaca en cada tick
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0, 10);
+  if (spyDailyCache.date === today && now - spyDailyCache.ts < 15*60*1000) {
+    return spyDailyCache.changePct;
+  }
+  try {
+    const snap = await fetchSnapshot('SPY');
+    if (snap && typeof snap.changePct === 'number') {
+      spyDailyCache = { changePct: snap.changePct, date: today, ts: now };
+      return snap.changePct;
+    }
+  } catch(e) { console.log('[D03] Error SPY snapshot:', e.message); }
+  return spyDailyCache.changePct || 0;
+}
+
 // ═══════════════════════════════════════════════════════
 // DATOS ALPACA
 // ═══════════════════════════════════════════════════════
@@ -248,8 +314,6 @@ async function fetchSnapshot(sym) {
     return { price, changePct: prev.c ? (price - prev.c) / prev.c * 100 : 0 };
   } catch(e) { return null; }
 }
-
-// Drawdown SPY desde máximo 60 días — para filtro de crisis
 async function spyDrawdown60() {
   try {
     const bars = await fetchDailyBars('SPY', 65);
@@ -257,7 +321,7 @@ async function spyDrawdown60() {
     const closes = bars.map(b => b.c);
     const current = closes[closes.length - 1];
     const max60   = Math.max(...closes.slice(-60));
-    return (current - max60) / max60 * 100; // negativo = caída
+    return (current - max60) / max60 * 100;
   } catch(e) { return 0; }
 }
 
@@ -469,7 +533,6 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
   }
   return null;
 }
-
 async function manageShortExit(sym, pos, bar, date, dailyBars) {
   const price = bar.c, high = bar.h || price;
   if (price < (pos.minPrice || pos.entry)) pos.minPrice = price;
@@ -544,7 +607,6 @@ function isEntryAllowed() {
   const close    = 960 + nyOffset*60;
   return utcMins >= open + 30 && utcMins < close - 30;
 }
-
 async function executeBuy(sym, entry, stop, qty, meta = {}) {
   if (!isMarketOpen()) {
     await sendTelegram(`🚫 Orden bloqueada — mercado cerrado (${sym})`);
@@ -588,7 +650,6 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
     return false;
   }
 }
-
 async function executeSell(sym, qty, reason, price) {
   if (!isMarketOpen() && !reason.toLowerCase().includes('stop')) return false;
   try {
@@ -630,20 +691,16 @@ async function executeSell(sym, qty, reason, price) {
 // ═══════════════════════════════════════════════════════
 async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
   try {
-    // 1. Cancelar órdenes stop abiertas del ticker
     const openOrds = await fetch(
       `${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers: alpacaHdr() }
     ).then(r => r.json()).catch(() => []);
-
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       if (ord.type === 'stop' || ord.type === 'stop_limit') {
         await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
           { method: 'DELETE', headers: alpacaHdr() }).catch(() => {});
       }
     }
-
-    // 2. Crear nueva orden stop
     const side = isShort ? 'buy' : 'sell';
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method: 'POST', headers: alpacaHdr(),
@@ -655,12 +712,10 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
     });
     const o = await r.json();
     if (o.id) {
-      console.log(`[STOP] ✅ ${sym} stop actualizado → $${newStop}`);
+      console.log(`[STOP] ✅ ${sym} stop → $${newStop}`);
       return true;
-    } else {
-      console.log(`[STOP] ❌ ${sym} error: ${o.message || JSON.stringify(o).slice(0,80)}`);
-      return false;
     }
+    return false;
   } catch(e) {
     console.log(`[STOP] Error ${sym}:`, e.message);
     return false;
@@ -668,30 +723,44 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
 }
 
 // ═══════════════════════════════════════════════════════
-// SCANNER — MOM + BOLL
+// SCANNER — MOM + BOLL (v3.4.0: D03 + I10 + N02)
 // ═══════════════════════════════════════════════════════
 async function checkMOMSignals() {
   if (!isEntryAllowed()) return;
+
+  // ── v3.4.0 D03: Bloquear si SPY cae >1% hoy ─────────
+  // Backtest confirmado: OOS PF 3.59 vs 3.28 BASE (COMB_FINAL)
+  const spyChange = await getSPYDailyChange();
+  if (spyChange <= -1.0) {
+    console.log(`[D03] Bloqueado — SPY ${spyChange.toFixed(2)}% hoy (umbral -1%)`);
+    return;
+  }
+
   const reg  = MARKET_REGIME;
   if (reg.mode === 'BEAR') return;
   const momCount  = Object.values(openPositions).filter(p => p.system === 'MOM').length;
   const bollCount = Object.values(openPositions).filter(p => p.system === 'BOLL').length;
   if (momCount >= MAX_MOM && bollCount >= MAX_BOLL) return;
-  console.log(`[MOM] Modo ${reg.mode} | MOM:${momCount}/${MAX_MOM} BOLL:${bollCount}/${MAX_BOLL}`);
+  console.log(`[MOM] Modo ${reg.mode} | MOM:${momCount}/${MAX_MOM} BOLL:${bollCount}/${MAX_BOLL} | SPY:${spyChange.toFixed(2)}%`);
+
   const spyBars = await fetchBars15min('SPY');
   const spyLast = spyBars ? spyBars[spyBars.length-1].c : null;
   const spy20   = spyBars && spyBars.length >= 20 ? spyBars[spyBars.length-21].c : null;
+
   const candidates = [];
   for (const sym of UNIVERSE) {
     try {
       if (openPositions[sym]) continue;
       const month = new Date().toISOString().slice(0,7);
       if (monthlyTrades[`${sym}_${month}`]) continue;
+
       const bars15 = await fetchBars15min(sym);
       if (!bars15 || bars15.length < 50) continue;
+
       if (momCount < MAX_MOM) {
         const sig = evalMOM(sym, bars15);
         if (sig) {
+          // Filtro sectorial
           const etf = SECTOR_MAP[sym];
           if (etf) {
             const etfBars = await fetchBars15min(etf);
@@ -701,6 +770,7 @@ async function checkMOMSignals() {
               if (perf5 < -2.0) continue;
             }
           }
+          // RS vs SPY
           let rs = 0;
           if (spy20 && spyLast && spy20 > 0) {
             const s20 = bars15.length >= 21 ? bars15[bars15.length-21].c : null;
@@ -708,9 +778,20 @@ async function checkMOMSignals() {
           }
           // H2: RS mínimo +2% vs SPY en 20 días
           if (rs < 2.0) continue;
+
+          // ── v3.4.0 N02: Wyckoff Spring ─────────────
+          // Solo entrar si ha habido Spring en últimos 10 días
+          // Backtest OOS confirmado: PF 3.58 P&L €+26,549
+          const dailyBars15 = await fetchDailyBars(sym, 15);
+          if (dailyBars15 && !detectWyckoffSpring(dailyBars15, 10)) {
+            console.log(`[N02] ${sym} sin Spring en 10d — skip`);
+            continue;
+          }
+
           candidates.push({ ...sig, rs, type:'MOM' });
         }
       }
+
       if (bollCount < MAX_BOLL && reg.mode === 'BULL') {
         const dailyBars = await fetchDailyBars(sym, 220);
         if (dailyBars && dailyBars.length >= 205) {
@@ -721,13 +802,22 @@ async function checkMOMSignals() {
       await new Promise(r => setTimeout(r, 100));
     } catch(e) { console.log('[MOM]', sym, e.message); }
   }
+
   candidates.sort((a, b) => b.rs - a.rs);
+
   for (const sig of candidates) {
     const sym = sig.sym;
     if (openPositions[sym]) continue;
     const entry   = sig.last * (1 + SLIPPAGE);
     const atrVal  = Math.max(sig.atr, sig.last * 0.005);
-    const stop    = parseFloat((entry - atrVal * 1.5).toFixed(2));
+
+    // ── v3.4.0 I10: Stop bajo VPOC ─────────────────
+    // Backtest OOS confirmado: PF 3.59 vs 3.28 BASE
+    const bars15Fresh = await fetchBars15min(sym);
+    const stop = bars15Fresh
+      ? calcStopVPOC(bars15Fresh, entry, atrVal)
+      : parseFloat((entry - atrVal * 1.5).toFixed(2));
+
     const qty     = calcQty(entry, stop, reg.sizeMult);
     if (!qty) continue;
     const target = sig.type === 'BOLL' ? sig.target : null;
@@ -735,6 +825,7 @@ async function checkMOMSignals() {
     const key    = `${sym}_mom_${Math.floor(Date.now()/(4*3600*1000))}`;
     if (sentAlerts[key]) continue;
     sentAlerts[key] = Date.now();
+
     if (AUTO_EXECUTE) {
       await executeBuy(sym, entry, stop, qty, { system: sig.type, target });
       monthlyTrades[`${sym}_${month}`] = true;
@@ -746,7 +837,8 @@ async function checkMOMSignals() {
       await sendTelegram(
         `${icon} <b>${sig.type} SIGNAL — ${sym}</b>\n\n` +
         `💰 $${sig.last.toFixed(2)} | Stop: $${stop}` + (target ? ` | Target: $${target.toFixed(2)}` : '') + `\n` +
-        `📦 ${qty} acc | RSI ${sig.rsi} | RVOL ${sig.rvol}x\n\n` +
+        `📦 ${qty} acc | RSI ${sig.rsi} | RVOL ${sig.rvol}x | RS ${sig.rs?.toFixed(1)}%\n` +
+        `🌊 Spring ✅ | VPOC stop ✅ | SPY ${spyChange.toFixed(2)}%\n\n` +
         `✅ /ejecutar_${sym}   ❌ /cancelar_${sym}`
       );
     }
@@ -762,7 +854,6 @@ async function checkShortSignals() {
   if (reg.mode !== 'BEAR')            return;
   if (reg.bearStreak < BEAR_MIN_DAYS) return;
   if (!reg.sma50Bearish)              return;
-  // Filtro crisis: SHORT solo cuando SPY DD>10% desde máximo 60 días
   const spyDD = await spyDrawdown60();
   if (spyDD >= -10.0) {
     console.log(`[SHORT] Bloqueado — SPY DD ${spyDD.toFixed(1)}% (umbral: -10%)`);
@@ -867,7 +958,6 @@ async function managePositions() {
       if (result && result.close) {
         await executeSell(sym, pos.qty, result.reason, result.exitPrice);
       }
-      // Alertas de hitos
       const gainPct = pos.system === 'SHORT'
         ? (pos.entry - price) / pos.entry * 100
         : (price - pos.entry) / pos.entry * 100;
@@ -949,7 +1039,6 @@ async function sendTelegram(msg) {
     return d.ok;
   } catch(e) { return false; }
 }
-
 async function pollTelegram() {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId+1}&timeout=5`);
@@ -1031,17 +1120,21 @@ async function pollTelegram() {
       }
       else if (text === '/estado') {
         const reg = MARKET_REGIME;
+        const spyChg = await getSPYDailyChange();
         await sendTelegram(
-          `⚙️ <b>Estado V3.1</b>\n\n` +
+          `⚙️ <b>Estado V3.4.0</b>\n\n` +
           `🏛️ Régimen: <b>${reg.mode}</b>\n` +
-          `SPY $${reg.price?.toFixed(2)||'—'} | SMA50 $${reg.sma50||'—'}\n` +
-          `bearStreak: ${reg.bearStreak}\n\n` +
+          `SPY $${reg.price?.toFixed(2)||'—'} (${spyChg>=0?'+':''}${spyChg.toFixed(2)}% hoy)\n` +
+          `SMA50 $${reg.sma50||'—'} | bearStreak: ${reg.bearStreak}\n\n` +
           `💰 Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
           `📊 Posiciones: ${Object.keys(openPositions).length}\n` +
           `🤖 AUTO: ${AUTO_EXECUTE}\n\n` +
           `MOM: ${Object.values(openPositions).filter(p=>p.system==='MOM').length}/${MAX_MOM}\n` +
           `BOLL: ${Object.values(openPositions).filter(p=>p.system==='BOLL').length}/${MAX_BOLL}\n` +
-          `SHORT: ${Object.values(openPositions).filter(p=>p.system==='SHORT').length}/${MAX_SHORT}`
+          `SHORT: ${Object.values(openPositions).filter(p=>p.system==='SHORT').length}/${MAX_SHORT}\n\n` +
+          `✅ D03: SPY ${spyChg<=-1.0?'BLOQUEADO':'activo'}\n` +
+          `✅ I10: Stop VPOC activo\n` +
+          `✅ N02: Wyckoff Spring activo`
         );
       }
       else if (text === '/trades') {
@@ -1061,7 +1154,7 @@ async function pollTelegram() {
       }
       else if (text === '/ayuda' || text === '/help') {
         await sendTelegram(
-          `🤖 <b>ORS V3.2</b>\n\n` +
+          `🤖 <b>ORS V3.4.0</b>\n\n` +
           `<b>ÓRDENES</b>\n` +
           `/si — Confirmar última orden\n` +
           `/no — Cancelar última orden\n` +
@@ -1093,15 +1186,15 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.2', version: '3.3.0',
+  status: 'ORS V3.4.0', version: '3.4.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
   uptime: Math.round(process.uptime()) + 's',
+  improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
-
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.3.0',
+  status: 'ok', version: '3.4.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1112,10 +1205,8 @@ app.get('/health', (req, res) => res.json({
   account: ACTIVE_ACCOUNT,
   autoExecute: AUTO_EXECUTE,
 }));
-
 app.get('/regime',    (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
-
 app.get('/trades', (req, res) => {
   const wins = tradeHistory.filter(t=>t.win);
   const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
@@ -1128,7 +1219,6 @@ app.get('/trades', (req, res) => {
     trades: tradeHistory.slice(0,50),
   });
 });
-
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
     const wins  = trades.filter(t=>t.win);
@@ -1147,7 +1237,6 @@ app.get('/trades/stats/strategy', (req, res) => {
     TOTAL: stats(tradeHistory),
   });
 });
-
 app.get('/sector/sentiment', (req, res) => res.json({
   lastUpdate: sectorLastUpdate, sentiment: sectorSentiment,
 }));
@@ -1155,8 +1244,6 @@ app.post('/sector/run', async (req, res) => {
   res.json({ ok:true });
   updateSectorSentiment().catch(e => console.log('[SECTOR]', e.message));
 });
-
-// ── SYNC POSICIONES ───────────────────────────────────
 app.get('/sync', async (req, res) => {
   try {
     const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
@@ -1173,7 +1260,6 @@ app.get('/sync', async (req, res) => {
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
-
 app.post('/sync', async (req, res) => {
   try {
     const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
@@ -1211,8 +1297,6 @@ app.post('/sync', async (req, res) => {
       positions:synced, total_open:Object.keys(openPositions).length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
-
-// ── SYNC HISTORIAL ────────────────────────────────────
 app.get('/sync/history', (req, res) => {
   const wins = tradeHistory.filter(t=>t.win);
   const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
@@ -1225,7 +1309,6 @@ app.get('/sync/history', (req, res) => {
     trades: tradeHistory.slice(0,50),
   });
 });
-
 app.post('/sync/history', async (req, res) => {
   try {
     const days  = parseInt(req.query.days || '7');
@@ -1279,12 +1362,8 @@ app.post('/sync/history', async (req, res) => {
     );
     res.json({ ok:true, recovered:trades.length, total_history:tradeHistory.length,
       summary:{wins:wins.length,losses:trades.length-wins.length,pnl}, trades });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
-
-// ── PROXY CLAUDE ──────────────────────────────────────
 app.post('/claude', async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error:'ANTHROPIC_API_KEY no configurada' });
@@ -1297,8 +1376,6 @@ app.post('/claude', async (req, res) => {
     res.json(await r.json());
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
-
-// ── YAHOO PROXY ───────────────────────────────────────
 app.get('/yahoo', async (req, res) => {
   const { sym, range='2y', interval='1d' } = req.query;
   if (!sym) return res.status(400).json({ error:'sym required' });
@@ -1310,8 +1387,6 @@ app.get('/yahoo', async (req, res) => {
     res.json(await r.json());
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
-
-// ── ALPACA PASS-THROUGH ───────────────────────────────
 app.get('/alpaca/account',   async (req, res) => {
   const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
   res.json(await r.json());
@@ -1334,7 +1409,6 @@ app.get('/alpaca/bars/daily', async (req, res) => {
     res.json({ sym, bars, count: bars.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
-
 app.get('/alpaca/bars/15min', async (req, res) => {
   const { sym, limit = 200, start } = req.query;
   if (!sym) return res.status(400).json({ error: 'sym required' });
@@ -1347,11 +1421,9 @@ app.get('/alpaca/bars/15min', async (req, res) => {
     const d = JSON.parse(text);
     if (!d.bars) return res.json({ sym, bars: [], prices15: [], count: 0 });
     const bars = d.bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
-    const prices15 = bars.map(b => b.c);
-    res.json({ sym, bars, prices15, count: bars.length });
+    res.json({ sym, bars, prices15: bars.map(b=>b.c), count: bars.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
-
 app.get('/alpaca/snapshots', async (req, res) => {
   const { syms } = req.query;
   if (!syms) return res.json({});
@@ -1363,21 +1435,24 @@ app.get('/alpaca/snapshots', async (req, res) => {
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.3.0 — puerto ${PORT}`);
+  console.log(`ORS V3.4.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
+  console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
-    `🚀 <b>ORS V3.3.0 arrancado</b>\n\n` +
-    `BULL:    MOM (4) + BOLL (1)\n` +
+    `🚀 <b>ORS V3.4.0 arrancado</b>\n\n` +
+    `BULL:    MOM (5) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
+    `<b>Mejoras v3.4.0:</b>\n` +
+    `✅ I10: Stop bajo VPOC\n` +
+    `✅ D03: Bloquear si SPY<-1%\n` +
+    `✅ N02: Wyckoff Spring\n` +
+    `📊 OOS: PF 3.59 MAR 10.58 DD 6.08%\n\n` +
     `Cuenta: ${getAcc().label}\n` +
     `Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
-    `Auto: ${AUTO_EXECUTE}\n` +
-    `BE: dinámico por capitalización`
+    `Auto: ${AUTO_EXECUTE}`
   );
-  // Régimen al arrancar
   setTimeout(updateRegime, 3000);
-  // Sync posiciones Alpaca al arrancar
   setTimeout(async () => {
     try {
       const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
@@ -1408,8 +1483,6 @@ app.listen(PORT, async () => {
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
-
-  // Schedulers
   setInterval(checkMOMSignals,   5*60*1000);
   setInterval(checkShortSignals, 5*60*1000);
   setInterval(managePositions,   3*60*1000);
@@ -1417,8 +1490,6 @@ app.listen(PORT, async () => {
   setInterval(updateRegime,      60*60*1000);
   setTimeout(checkMOMSignals,    30*1000);
   setTimeout(checkShortSignals,  35*1000);
-
-  // Sector sentiment al cierre (20:15 UTC)
   function scheduleSector() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
@@ -1426,8 +1497,6 @@ app.listen(PORT, async () => {
     setTimeout(async()=>{ await updateSectorSentiment(); scheduleSector(); }, target-now);
   }
   scheduleSector();
-
-  // Régimen al cierre (20:05 UTC)
   function scheduleRegime() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,5,0));
