@@ -1590,16 +1590,26 @@ app.get('/yahoo', async (req, res) => {
       `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=${interval}&range=${range}`,
       { headers:{ 'User-Agent':'Mozilla/5.0' } }
     );
-    res.json(await r.json());
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    try { res.json(JSON.parse(text)); } catch(e) { res.json({}); }
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
-app.get('/alpaca/account',   async (req, res) => {
-  const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
-  res.json(await r.json());
+app.get('/alpaca/account', async (req, res) => {
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    try { res.json(JSON.parse(text)); } catch(e) { res.json({}); }
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/alpaca/positions', async (req, res) => {
-  const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
-  res.json(await r.json());
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json([]);
+    try { res.json(JSON.parse(text)); } catch(e) { res.json([]); }
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/alpaca/bars/daily', async (req, res) => {
   const { sym, limit = 504 } = req.query;
@@ -1623,12 +1633,16 @@ app.get('/alpaca/bars/15min', async (req, res) => {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=15Min&limit=${limit}&feed=iex&sort=asc&start=${startDate}`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
-    if (!text || text === 'Not Found') return res.json({ sym, bars: [], prices15: [], count: 0 });
-    const d = JSON.parse(text);
+    if (!text || text === 'Not Found' || text.trim().startsWith('<'))
+      return res.json({ sym, bars: [], prices15: [], count: 0 });
+    let d;
+    try { d = JSON.parse(text); } catch(e) {
+      return res.json({ sym, bars: [], prices15: [], count: 0 });
+    }
     if (!d.bars) return res.json({ sym, bars: [], prices15: [], count: 0 });
     const bars = d.bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
     res.json({ sym, bars, prices15: bars.map(b=>b.c), count: bars.length });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.json({ sym, bars: [], prices15: [], count: 0 }); }
 });
 app.get('/alpaca/snapshots', async (req, res) => {
   const { syms } = req.query;
