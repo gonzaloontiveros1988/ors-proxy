@@ -1,4 +1,4 @@
-// server.js — v3.5.0
+// server.js — v3.5.1
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -1378,7 +1378,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.0', version: '3.5.0',
+  status: 'ORS V3.5.1', version: '3.5.1',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1386,7 +1386,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.5.0',
+  status: 'ok', version: '3.5.1',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
