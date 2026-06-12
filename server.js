@@ -1,4 +1,5 @@
-// server.js — v3.5.3
+
+// server.js — v3.5.4
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -61,15 +62,15 @@ const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
 const ALPACA_DATA = 'https://data.alpaca.markets';
 const ALPACA_ACCOUNTS = {
   paper2: {
-    key:    process.env.ALPACA_KEY_2    || process.env.ALPACA_KEY    || '',
-    secret: process.env.ALPACA_SECRET_2 || process.env.ALPACA_SECRET || '',
-    base:   process.env.ALPACA_BASE     || 'https://paper-api.alpaca.markets',
+    key:    process.env.ALPACA_KEY_2      || process.env.ALPACA_PAPER_KEY    || process.env.ALPACA_KEY    || '',
+    secret: process.env.ALPACA_SECRET_2   || process.env.ALPACA_PAPER_SECRET || process.env.ALPACA_SECRET || '',
+    base:   process.env.ALPACA_BASE_2     || process.env.ALPACA_PAPER_URL    || process.env.ALPACA_BASE   || 'https://paper-api.alpaca.markets',
     label:  '📊 PAPER €11k',
   },
   live: {
     key:    process.env.ALPACA_LIVE_KEY    || '',
     secret: process.env.ALPACA_LIVE_SECRET || '',
-    base:   'https://api.alpaca.markets',
+    base:   process.env.ALPACA_LIVE_URL    || 'https://api.alpaca.markets',
     label:  '💰 LIVE',
   },
 };
@@ -1391,7 +1392,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.3', version: '3.5.3',
+  status: 'ORS V3.5.4', version: '3.5.4',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1399,7 +1400,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.5.3',
+  status: 'ok', version: '3.5.4',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1818,7 +1819,7 @@ app.get('/ibkr/positions', (req, res) => res.json([]));
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.5.3 — puerto ${PORT}`);
+  console.log(`ORS V3.5.4 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
