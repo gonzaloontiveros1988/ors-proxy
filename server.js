@@ -1,4 +1,4 @@
-// server.js — v3.5.1
+// server.js — v3.5.2
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -352,7 +352,9 @@ async function fetchDailyBars(sym, limit = 220) {
   try {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
-    const d   = await r.json();
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return null;
+    const d = JSON.parse(text);
     if (!d.bars) return null;
     return d.bars.map(b => ({ t:b.t.slice(0,10), o:b.o, h:b.h, l:b.l, c:b.c, v:b.v||0 }));
   } catch(e) { return null; }
@@ -1229,7 +1231,9 @@ async function sendTelegram(msg) {
 async function pollTelegram() {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId+1}&timeout=5`);
-    const d = await r.json();
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return;
+    const d = JSON.parse(text);
     if (!d.ok || !d.result.length) return;
     for (const update of d.result) {
       lastUpdateId = update.update_id;
@@ -1378,7 +1382,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.1', version: '3.5.1',
+  status: 'ORS V3.5.2', version: '3.5.2',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1386,7 +1390,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.5.1',
+  status: 'ok', version: '3.5.2',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1629,8 +1633,12 @@ app.get('/alpaca/bars/15min', async (req, res) => {
 app.get('/alpaca/snapshots', async (req, res) => {
   const { syms } = req.query;
   if (!syms) return res.json({});
-  const r = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${syms}&feed=iex`, { headers:alpacaHdr() });
-  res.json(await r.json());
+  try {
+    const r = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${syms}&feed=iex`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    res.json(JSON.parse(text));
+  } catch(e) { res.json({}); }
 });
 
 // ═══════════════════════════════════════════════════════
@@ -1787,7 +1795,7 @@ app.get('/ibkr/positions', (req, res) => res.json([]));
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.5.1 — puerto ${PORT}`);
+  console.log(`ORS V3.5.2 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
