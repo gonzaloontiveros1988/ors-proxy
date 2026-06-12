@@ -129,6 +129,10 @@ let sectorSentiment  = {};
 let sectorLastUpdate = null;
 // Cache SPY diario para D03
 let spyDailyCache = { changePct: 0, date: '', ts: 0 };
+// LAB y watchlist dinámica
+let labHypotheses = [];
+let labReviews    = [];
+let dynWatchlist  = [];
 
 // ── F8: PERSISTENCIA DE ESTADO ────────────────────────
 // Nota: en Render el disco se borra en cada deploy; esto protege frente a
@@ -1630,10 +1634,160 @@ app.get('/alpaca/snapshots', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════
+// ENDPOINTS ADICIONALES — v3.5.1
+// ═══════════════════════════════════════════════════════
+
+// ── WATCHLIST DINÁMICA ───────────────────────────────────
+app.get('/watchlist/dynamic', (req, res) => {
+  res.json({ dynamic: dynWatchlist });
+});
+app.post('/watchlist/dynamic', (req, res) => {
+  const { sym } = req.body;
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+  if (!dynWatchlist.find(x => x.sym === sym))
+    dynWatchlist.push({ sym: sym.toUpperCase(), ts: Date.now() });
+  res.json({ ok: true, dynamic: dynWatchlist });
+});
+app.delete('/watchlist/dynamic/:sym', (req, res) => {
+  dynWatchlist = dynWatchlist.filter(x => x.sym !== req.params.sym.toUpperCase());
+  res.json({ ok: true, dynamic: dynWatchlist });
+});
+
+// ── LAB — HIPÓTESIS ─────────────────────────────────────
+app.get('/lab/hypotheses', (req, res) => res.json(labHypotheses));
+app.post('/lab/hypotheses', (req, res) => {
+  const h = req.body;
+  if (!h || !h.hypothesis) return res.status(400).json({ error: 'hypothesis required' });
+  const entry = { id: Date.now().toString(), hypothesis: h.hypothesis,
+    category: h.category || 'general', status: h.status || 'pending',
+    created: new Date().toISOString(), notes: h.notes || '' };
+  labHypotheses.unshift(entry);
+  res.json({ ok: true, id: entry.id, entry });
+});
+app.put('/lab/hypotheses/:id', (req, res) => {
+  const idx = labHypotheses.findIndex(h => h.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'not found' });
+  labHypotheses[idx] = Object.assign(labHypotheses[idx], req.body, { id: req.params.id });
+  res.json({ ok: true, entry: labHypotheses[idx] });
+});
+app.delete('/lab/hypotheses/:id', (req, res) => {
+  labHypotheses = labHypotheses.filter(h => h.id !== req.params.id);
+  res.json({ ok: true });
+});
+
+// ── LAB — REVIEWS ───────────────────────────────────────
+app.get('/lab/reviews', (req, res) => res.json(labReviews));
+app.post('/lab/reviews', (req, res) => {
+  const r = req.body;
+  const entry = { id: Date.now().toString(), title: r.title || 'Review',
+    content: r.content || '', created: new Date().toISOString(),
+    decisions: r.decisions || '' };
+  labReviews.unshift(entry);
+  res.json({ ok: true, id: entry.id, entry });
+});
+
+// ── TRADES — STATS DB ────────────────────────────────────
+app.get('/trades/stats/db', (req, res) => {
+  const days  = parseInt(req.query.days) || 30;
+  const since = Date.now() - days * 24 * 60 * 60 * 1000;
+  const recent = tradeHistory.filter(t => new Date(t.exitDate || t.date).getTime() >= since);
+  const wins   = recent.filter(t => t.pnl > 0);
+  const losses = recent.filter(t => t.pnl <= 0);
+  const grossW = wins.reduce((s,t) => s+t.pnl, 0);
+  const grossL = Math.abs(losses.reduce((s,t) => s+t.pnl, 0));
+  res.json({
+    days, n: recent.length, wins: wins.length, losses: losses.length,
+    wr:    recent.length ? (wins.length/recent.length*100).toFixed(1) : 0,
+    pf:    grossL > 0 ? (grossW/grossL).toFixed(2) : null,
+    pnl:   recent.reduce((s,t) => s+t.pnl, 0).toFixed(2),
+    grossW: grossW.toFixed(2), grossL: grossL.toFixed(2),
+  });
+});
+
+// ── TRADES — DECISIONS ───────────────────────────────────
+app.get('/trades/decisions', (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  res.json(tradeHistory.slice(0, limit).map(t => ({ ...t, decisions: t.reason || '' })));
+});
+
+// ── NOTICIAS ─────────────────────────────────────────────
+app.get('/alpaca/news', async (req, res) => {
+  try {
+    const { syms, limit = 10 } = req.query;
+    if (!syms) return res.json([]);
+    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=${limit}`, { headers: alpacaHdr() });
+    const d = await r.json();
+    res.json(d.news || d || []);
+  } catch(e) { res.json([]); }
+});
+app.get('/news/headlines', async (req, res) => {
+  try {
+    const { syms } = req.query;
+    if (!syms) return res.json([]);
+    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=20`, { headers: alpacaHdr() });
+    const d = await r.json();
+    res.json(d.news || d || []);
+  } catch(e) { res.json([]); }
+});
+
+// ── SCANNER MOM ──────────────────────────────────────────
+app.get('/scan/mom', (req, res) => {
+  const limit = parseInt(req.query.limit) || 30;
+  res.json(UNIVERSE.slice(0, limit).filter(sym => !openPositions[sym])
+    .map(sym => ({ sym, inUniverse: true, open: false })));
+});
+
+// ── ALPACA — CUENTA ACTIVA / SWITCH ──────────────────────
+app.get('/alpaca/active', (req, res) => res.json({
+  account: ACTIVE_ACCOUNT, label: getAcc().label,
+  base: alpacaBase(), isLive: isLive(),
+}));
+app.post('/alpaca/switch', (req, res) => {
+  const { account } = req.body;
+  if (!account || !ALPACA_ACCOUNTS[account])
+    return res.status(400).json({ error: 'Invalid account. Use: paper2 or live' });
+  ACTIVE_ACCOUNT = account;
+  console.log(`[ACCOUNT] Cambiado a: ${getAcc().label}`);
+  res.json({ ok: true, account: ACTIVE_ACCOUNT, label: getAcc().label });
+});
+
+// ── ALPACA — ÓRDENES MANUALES ────────────────────────────
+app.post('/alpaca/order', async (req, res) => {
+  try {
+    const { sym, qty, side, type = 'market', tif = 'day' } = req.body;
+    if (!sym || !qty || !side) return res.status(400).json({ error: 'sym, qty, side required' });
+    const r = await fetch(`${alpacaBase()}/v2/orders`, {
+      method: 'POST', headers: alpacaHdr(),
+      body: JSON.stringify({ symbol: sym, qty: String(qty), side, type, time_in_force: tif }),
+    });
+    const d = await r.json();
+    if (d.id) {
+      console.log(`[ORDER] ${side} ${qty} ${sym} → ${d.id}`);
+      await sendTelegram(`📋 <b>Orden manual</b>\n${side.toUpperCase()} ${qty} ${sym}\nID: ${d.id}`);
+    }
+    res.json(d);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── TELEGRAM — enviar mensaje manual ────────────────────
+app.post('/telegram', async (req, res) => {
+  try {
+    const msg = req.body.text || req.body.message || '';
+    if (!msg) return res.status(400).json({ error: 'text required' });
+    await sendTelegram(msg);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── IBKR — stubs ─────────────────────────────────────────
+app.get('/ibkr/status',    (req, res) => res.json({ connected: false, message: 'IBKR no conectado en V3' }));
+app.get('/ibkr/positions', (req, res) => res.json([]));
+
+// ═══════════════════════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.4.0 — puerto ${PORT}`);
+  console.log(`ORS V3.5.1 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
