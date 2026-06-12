@@ -1,4 +1,4 @@
-// server.js — v3.4.0
+// server.js — v3.5.0
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -8,7 +8,19 @@
 // v3.1.0: /sync + /sync/history endpoints
 // v3.4.0: COMB_FINAL — I10 (Stop VPOC) + D03 (SPY>-1%) + N02 (Wyckoff Spring)
 //         Backtest OOS confirmado: PF 3.59 MAR 10.58 DD 6.08%
+// v3.5.0: HARDENING DE EJECUCIÓN (sin cambios en lógica de señales):
+//   F1: Auth x-api-key en endpoints (activar con env PROXY_API_KEY)
+//   F2: Órdenes OTO (entrada+stop atómicos) — imposible posición sin stop
+//   F3: Fill real leído de Alpaca (waitForFill) — entry/riesgo con precio real
+//   F4: Guard anti doble-venta en executeSell (verifica posición en broker)
+//   F5: FIX CRÍTICO — cierre de SHORT usaba side:'sell' (aumentaba el corto)
+//       y P&L con signo invertido. Ahora buy-to-cover + P&L correcto.
+//   F6: reconcilePositions cada 5min (broker vs servidor + stops huérfanos)
+//   F7: nyOffset dinámico en isEntryAllowed (regla 30min sobrevive al invierno)
+//   F8: Persistencia de estado en state.json (posiciones/diario/monthlyTrades)
+//   F9: Sync de arranque lee stops REALES del broker (no inventa ±3%)
 'use strict';
+const fs = require('fs');
 const express = require('express');
 const app = express();
 app.use(express.json());
@@ -19,6 +31,19 @@ app.use(function(req, res, next) {
   res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
+});
+// ── F1: AUTH ──────────────────────────────────────────
+// Activar definiendo PROXY_API_KEY en Render. Mientras no esté definida,
+// el comportamiento es idéntico al anterior (para no romper el frontend
+// hasta que ORS-APP envíe el header x-api-key).
+const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
+const PUBLIC_PATHS  = ['/', '/health'];
+app.use(function(req, res, next) {
+  if (!PROXY_API_KEY) return next();
+  if (PUBLIC_PATHS.indexOf(req.path) !== -1) return next();
+  const k = req.headers['x-api-key'] || req.query.key;
+  if (k === PROXY_API_KEY) return next();
+  return res.status(401).json({ error: 'unauthorized' });
 });
 // ── CONFIG ────────────────────────────────────────────
 const PORT       = process.env.PORT       || 3000;
@@ -104,10 +129,32 @@ let sectorSentiment  = {};
 let sectorLastUpdate = null;
 // Cache SPY diario para D03
 let spyDailyCache = { changePct: 0, date: '', ts: 0 };
-// LAB y watchlist dinámica
-let labHypotheses = [];
-let labReviews    = [];
-let dynWatchlist  = [];
+
+// ── F8: PERSISTENCIA DE ESTADO ────────────────────────
+// Nota: en Render el disco se borra en cada deploy; esto protege frente a
+// reinicios del proceso. Para persistencia total entre deploys, montar un
+// disco persistente o exportar el diario periódicamente.
+const STATE_FILE = process.env.STATE_FILE || './state.json';
+function saveState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      openPositions,
+      tradeHistory: tradeHistory.slice(0, 500),
+      monthlyTrades,
+      savedAt: new Date().toISOString(),
+    }));
+  } catch(e) { console.log('[STATE] save:', e.message); }
+}
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s.openPositions) Object.assign(openPositions, s.openPositions);
+    if (Array.isArray(s.tradeHistory)) tradeHistory = s.tradeHistory;
+    if (s.monthlyTrades) Object.assign(monthlyTrades, s.monthlyTrades);
+    console.log(`[STATE] Restaurado: ${Object.keys(openPositions).length} pos, ${tradeHistory.length} trades (guardado ${s.savedAt})`);
+  } catch(e) { console.log('[STATE] load:', e.message); }
+}
 
 // ═══════════════════════════════════════════════════════
 // INDICADORES
@@ -585,66 +632,95 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
 // ═══════════════════════════════════════════════════════
 // ALPACA EXECUTION
 // ═══════════════════════════════════════════════════════
-function isMarketOpen() {
-  const now     = new Date();
-  const utcDay  = now.getUTCDay();
-  if (utcDay === 0 || utcDay === 6) return false;
-  const nyOffset = (() => {
-    const nyStr = now.toLocaleString('en-US', { timeZone:'America/New_York',
-      hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false });
-    const [h, m] = nyStr.split(':').map(Number);
-    const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
-    const nyMins  = h*60 + m;
-    return Math.round((utcMins - nyMins) / 60);
-  })();
+function nyOffsetHours() {
+  const now   = new Date();
+  const nyStr = now.toLocaleString('en-US', { timeZone:'America/New_York',
+    hour:'2-digit', minute:'2-digit', hour12:false });
+  const [h, m]  = nyStr.split(':').map(Number);
   const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
-  const open    = 570 + Math.abs(nyOffset)*60;
-  const close   = 960 + Math.abs(nyOffset)*60;
+  let diff = utcMins - (h*60 + m);
+  if (diff < -720) diff += 1440;   // cruce de medianoche UTC
+  if (diff >  720) diff -= 1440;
+  return Math.round(diff / 60);
+}
+function isMarketOpen() {
+  const now    = new Date();
+  const utcDay = now.getUTCDay();
+  if (utcDay === 0 || utcDay === 6) return false;
+  const off     = Math.abs(nyOffsetHours());
+  const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
+  const open    = 570 + off*60;
+  const close   = 960 + off*60;
   return utcMins >= open && utcMins < close;
 }
 function isEntryAllowed() {
   if (!isMarketOpen()) return false;
-  const now      = new Date();
-  const nyOffset = 4;
-  const utcMins  = now.getUTCHours()*60 + now.getUTCMinutes();
-  const open     = 570 + nyOffset*60;
-  const close    = 960 + nyOffset*60;
+  // F7: offset dinámico (antes hardcodeado a 4 — la regla de 30min
+  // desaparecía en horario de invierno)
+  const off     = Math.abs(nyOffsetHours());
+  const now     = new Date();
+  const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
+  const open    = 570 + off*60;
+  const close   = 960 + off*60;
   return utcMins >= open + 30 && utcMins < close - 30;
 }
+// F3: esperar y leer el fill real de una orden (hasta maxSecs segundos)
+async function waitForFill(orderId, maxSecs = 10) {
+  for (let i = 0; i < maxSecs; i++) {
+    try {
+      const o = await fetch(`${alpacaBase()}/v2/orders/${orderId}`,
+        { headers: alpacaHdr() }).then(r => r.json());
+      if (o.status === 'filled') {
+        return { price: parseFloat(o.filled_avg_price), qty: parseFloat(o.filled_qty) };
+      }
+      if (['canceled','rejected','expired'].indexOf(o.status) !== -1) return null;
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return null;
+}
+
 async function executeBuy(sym, entry, stop, qty, meta = {}) {
   if (!isMarketOpen()) {
     await sendTelegram(`🚫 Orden bloqueada — mercado cerrado (${sym})`);
     return false;
   }
   try {
+    // F2: orden OTO — entrada market + stop GTC atómicos en el broker.
+    // Si Alpaca acepta la entrada, el stop existe por construcción.
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'buy',
-        type:'market', time_in_force:'day' }),
+      body: JSON.stringify({
+        symbol:sym, qty:String(qty), side:'buy',
+        type:'market', time_in_force:'gtc',
+        order_class:'oto',
+        stop_loss:{ stop_price:String(stop) },
+      }),
     });
     const o = await r.json();
     if (!o.id) {
       await sendTelegram(`❌ Error Alpaca ${sym}: ${o.message || JSON.stringify(o).slice(0,100)}`);
       return false;
     }
-    await new Promise(r => setTimeout(r, 1500));
-    await fetch(`${alpacaBase()}/v2/orders`, {
-      method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
-        type:'stop', stop_price:String(stop), time_in_force:'gtc' }),
-    });
-    const riskEur = Math.round((entry - stop) * qty / EUR_USD);
+    // F3: registrar con el precio de fill REAL, no el teórico
+    const fill = await waitForFill(o.id, 10);
+    const entryReal = (fill && fill.price) ? fill.price : entry;
+    if (!fill) await sendTelegram(`⚠️ ${sym}: sin confirmación de fill en 10s — registrado con precio teórico $${entry.toFixed(2)}. RECON lo corregirá.`);
+    const riskEur = Math.round((entryReal - stop) * qty / EUR_USD);
     openPositions[sym] = {
-      sym, qty, entry, stop, entryDate: new Date().toISOString().slice(0,10),
-      maxPrice: entry, minPrice: entry,
+      sym, qty, entry: entryReal, stop, entryDate: new Date().toISOString().slice(0,10),
+      maxPrice: entryReal, minPrice: entryReal,
       be:false, runner:false, system: meta.system || 'MOM',
       target: meta.target || null, ts: Date.now(),
+      orderId: o.id, entrySenal: entry,
     };
+    saveState();
     const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
+    const slipBps = entry > 0 ? Math.round((entryReal/entry - 1) * 10000) : 0;
     await sendTelegram(
       `✅ <b>${meta.system||'MOM'} EJECUTADO — ${sym}</b>\n${mode}\n\n` +
-      `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
-      `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
+      `💰 ${qty} acc @ $${entryReal.toFixed(2)} (señal $${entry.toFixed(2)} · slip ${slipBps>=0?'+':''}${slipBps}bps)\n` +
+      `🛑 Stop: $${stop} (OTO) · Riesgo: ~€${riskEur}\n` +
       (meta.target ? `🎯 Target: $${meta.target.toFixed(2)}\n` : '') +
       `\n/cerrar_${sym}`
     );
@@ -657,33 +733,66 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
 async function executeSell(sym, qty, reason, price) {
   if (!isMarketOpen() && !reason.toLowerCase().includes('stop')) return false;
   try {
+    const pos = openPositions[sym];
+    const isShortPos = pos && pos.system === 'SHORT';
+    // F5: P&L con signo correcto según dirección
+    const pnlOf = (exitPx) => pos
+      ? Math.round((isShortPos ? (pos.entry - exitPx) : (exitPx - pos.entry)) * qty / EUR_USD)
+      : 0;
+
+    // F4: guard anti doble-venta — ¿la posición sigue viva en el broker?
+    // Si el stop GTC de Alpaca ya se ejecutó, registrar y NO enviar orden
+    // (antes: se enviaba otra venta a mercado → corto accidental).
+    const chk = await fetch(`${alpacaBase()}/v2/positions/${sym}`, { headers: alpacaHdr() });
+    if (chk.status === 404) {
+      if (pos) {
+        const pnl = pnlOf(price);
+        tradeHistory.unshift({
+          sym, system: pos.system, entry: pos.entry, exit: price,
+          qty, pnlEur: pnl, win: pnl > 0,
+          entryDate: pos.entryDate, exitDate: new Date().toISOString().slice(0,10),
+          exitReason: 'StopBroker',
+        });
+        if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
+        delete openPositions[sym];
+        saveState();
+        await sendTelegram(`🛑 <b>${sym} ya cerrado por stop del broker</b>\nP&L estimado: ${pnlOf(price) >= 0 ? '+' : ''}€${pnlOf(price)}`);
+      }
+      return true;
+    }
+
     const openOrds = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers:alpacaHdr() }).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
         { method:'DELETE', headers:alpacaHdr() }).catch(() => {});
     }
+    // F5: para cerrar un SHORT se COMPRA (buy-to-cover), no se vende más
+    const side = isShortPos ? 'buy' : 'sell';
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
+      body: JSON.stringify({ symbol:sym, qty:String(qty), side,
         type:'market', time_in_force:'day' }),
     });
     const o = await r.json();
     if (!o.id) return false;
-    const pos = openPositions[sym];
-    const pnl = pos ? Math.round((price - pos.entry) * qty / EUR_USD) : 0;
+    // F3: usar fill real también en la salida
+    const fill = await waitForFill(o.id, 10);
+    const exitReal = (fill && fill.price) ? fill.price : price;
+    const pnl = pnlOf(exitReal);
     if (pos) {
       tradeHistory.unshift({
-        sym, system: pos.system, entry: pos.entry, exit: price,
+        sym, system: pos.system, entry: pos.entry, exit: exitReal,
         qty, pnlEur: pnl, win: pnl > 0,
         entryDate: pos.entryDate, exitDate: new Date().toISOString().slice(0,10),
         exitReason: reason,
       });
-      if (tradeHistory.length > 200) tradeHistory = tradeHistory.slice(0, 200);
+      if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
     }
     delete openPositions[sym];
+    saveState();
     await sendTelegram(
-      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ ~$${price.toFixed(2)}\n` +
+      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ $${exitReal.toFixed(2)} (${side})\n` +
       `Motivo: ${reason}\nP&L: ${pnl >= 0 ? '+' : ''}€${pnl}`
     );
     return true;
@@ -905,22 +1014,28 @@ async function checkShortSignals() {
     sentAlerts[key] = Date.now();
     if (AUTO_EXECUTE) {
       try {
+        // F2: OTO también en SHORT — entrada + stop de recompra atómicos
         const r = await fetch(`${alpacaBase()}/v2/orders`, {
           method:'POST', headers:alpacaHdr(),
           body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
-            type:'market', time_in_force:'day' }),
+            type:'market', time_in_force:'gtc',
+            order_class:'oto', stop_loss:{ stop_price:String(stop) } }),
         });
         const o = await r.json();
         if (o.id) {
-          openPositions[sym] = { sym, qty, entry, stop,
+          const fill = await waitForFill(o.id, 10);
+          const entryReal = (fill && fill.price) ? fill.price : entry;
+          openPositions[sym] = { sym, qty, entry: entryReal, stop,
             entryDate: new Date().toISOString().slice(0,10),
-            minPrice:entry, be:false, runner:false, system:'SHORT', ts:Date.now() };
+            minPrice:entryReal, be:false, runner:false, system:'SHORT',
+            ts:Date.now(), orderId:o.id, entrySenal:entry };
           monthlyTrades[`${sym}_short_${month}`] = true;
-          const riskEur = Math.round((stop - entry) * qty / EUR_USD);
+          saveState();
+          const riskEur = Math.round((stop - entryReal) * qty / EUR_USD);
           await sendTelegram(
             `📉 <b>SHORT EJECUTADO — ${sym}</b>\n\n` +
-            `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
-            `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
+            `💰 ${qty} acc @ $${entryReal.toFixed(2)}\n` +
+            `🛑 Stop: $${stop} (OTO) · Riesgo: ~€${riskEur}\n` +
             `📊 RSI ${sig.rsi} | RS ${sig.spyRS?.toFixed(1)}% vs SPY\n\n/cerrar_${sym}`
           );
         }
@@ -976,6 +1091,70 @@ async function managePositions() {
       await new Promise(r => setTimeout(r, 300));
     } catch(e) { console.log('[MANAGE]', sym, e.message); }
   }
+}
+
+// ═══════════════════════════════════════════════════════
+// F6: RECONCILIACIÓN BROKER ↔ SERVIDOR (cada 5 min)
+// El servidor deja de "creer" su estado: lo verifica contra Alpaca.
+// ═══════════════════════════════════════════════════════
+async function reconcilePositions() {
+  try {
+    const [posRes, ordRes] = await Promise.all([
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+    ]);
+    const alpacaPos = Array.isArray(posRes) ? posRes : [];
+    const orders    = Array.isArray(ordRes) ? ordRes : [];
+    const posBySym  = {};
+    alpacaPos.forEach(p => { posBySym[p.symbol] = p; });
+    const stopBySym = {};
+    orders.forEach(o => {
+      if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+    });
+
+    // 1) El servidor cree que está abierta pero el broker ya la cerró
+    //    (el stop GTC se ejecutó entre polls) → registrar trade y limpiar
+    for (const sym of Object.keys(openPositions)) {
+      if (!posBySym[sym]) {
+        const pos  = openPositions[sym];
+        const snap = await fetchSnapshot(sym).catch(() => null);
+        const px   = (snap && snap.price) ? snap.price : pos.stop;
+        const pnl  = Math.round(
+          (pos.system === 'SHORT' ? (pos.entry - px) : (px - pos.entry)) * pos.qty / EUR_USD
+        );
+        tradeHistory.unshift({
+          sym, system: pos.system, entry: pos.entry, exit: px, qty: pos.qty,
+          pnlEur: pnl, win: pnl > 0, entryDate: pos.entryDate,
+          exitDate: new Date().toISOString().slice(0,10), exitReason: 'StopBroker',
+        });
+        if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
+        delete openPositions[sym];
+        await sendTelegram(`🔄 <b>RECON: ${sym} cerrado en broker</b>\nStop GTC ejecutado · P&L estimado: ${pnl >= 0 ? '+' : ''}€${pnl}`);
+      }
+    }
+    // 2) Posición en el broker que el servidor no conoce → alertar
+    for (const p of alpacaPos) {
+      if (!openPositions[p.symbol]) {
+        await sendTelegram(`⚠️ <b>RECON: posición huérfana ${p.symbol}</b> (${p.qty} acc, ${p.side})\nUsa POST /sync para adoptarla.`);
+      }
+    }
+    // 3) Posición registrada SIN stop vivo en el broker → recolocar y alertar
+    for (const sym of Object.keys(openPositions)) {
+      if (posBySym[sym] && !stopBySym[sym]) {
+        const pos = openPositions[sym];
+        await sendTelegram(`🚨 <b>RECON: ${sym} SIN STOP en broker</b>\nRecolocando stop $${pos.stop}`);
+        await updateAlpacaStop(sym, pos.qty, pos.stop, pos.system === 'SHORT');
+      }
+    }
+    // 4) Diferencia de cantidad → alertar (fills parciales, intervención manual)
+    for (const sym of Object.keys(openPositions)) {
+      const p = posBySym[sym];
+      if (p && Math.abs(parseInt(p.qty)) !== openPositions[sym].qty) {
+        await sendTelegram(`⚠️ <b>RECON: qty difiere en ${sym}</b>\nServidor: ${openPositions[sym].qty} · Broker: ${Math.abs(parseInt(p.qty))}`);
+      }
+    }
+    saveState();
+  } catch(e) { console.log('[RECON]', e.message); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1071,16 +1250,21 @@ async function pollTelegram() {
           const r2 = await fetch(`${alpacaBase()}/v2/orders`, {
             method:'POST', headers:alpacaHdr(),
             body: JSON.stringify({ symbol:sym, qty:String(order.qty), side:'sell',
-              type:'market', time_in_force:'day' }),
+              type:'market', time_in_force:'gtc',
+              order_class:'oto', stop_loss:{ stop_price:String(order.stop) } }),
           });
           const o = await r2.json();
           if (o.id) {
-            openPositions[sym] = { ...order, entryDate:new Date().toISOString().slice(0,10),
-              minPrice:order.entry, be:false, runner:false, ts:Date.now() };
+            const fill = await waitForFill(o.id, 10);
+            const entryReal = (fill && fill.price) ? fill.price : order.entry;
+            openPositions[sym] = { ...order, entry: entryReal,
+              entryDate:new Date().toISOString().slice(0,10),
+              minPrice:entryReal, be:false, runner:false, ts:Date.now(), orderId:o.id };
             const month = new Date().toISOString().slice(0,7);
             monthlyTrades[`${sym}_short_${month}`] = true;
             delete pendingOrders[sym];
-            await sendTelegram(`✅ SHORT ejecutado — ${sym} ${order.qty} acc`);
+            saveState();
+            await sendTelegram(`✅ SHORT ejecutado — ${sym} ${order.qty} acc @ $${entryReal.toFixed(2)} (stop OTO $${order.stop})`);
           }
         } else {
           await executeBuy(sym, order.entry, order.stop, order.qty,
@@ -1190,7 +1374,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.4.0', version: '3.4.0',
+  status: 'ORS V3.5.0', version: '3.5.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1198,7 +1382,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.4.0',
+  status: 'ok', version: '3.5.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1266,10 +1450,17 @@ app.get('/sync', async (req, res) => {
 });
 app.post('/sync', async (req, res) => {
   try {
-    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
-    const positions = await r.json();
+    const [posRes, ordRes] = await Promise.all([
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+    ]);
+    const positions = posRes;
     if (!Array.isArray(positions))
       return res.status(500).json({ error: 'Error Alpaca', raw: positions });
+    const stopBySym = {};
+    (Array.isArray(ordRes) ? ordRes : []).forEach(o => {
+      if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+    });
     const synced = [], skipped = [];
     for (const p of positions) {
       const sym = p.symbol;
@@ -1278,17 +1469,20 @@ app.post('/sync', async (req, res) => {
       const qty  = Math.abs(parseInt(p.qty));
       const side = p.side;
       const system = side === 'short' ? 'SHORT' : 'MOM';
-      const stop = side === 'short'
+      // F9: stop real del broker si existe; fallback ±3% marcado
+      const realStop = stopBySym[sym] ? parseFloat(stopBySym[sym].stop_price) : null;
+      const stop = realStop !== null ? realStop : (side === 'short'
         ? parseFloat((ep * 1.03).toFixed(2))
-        : parseFloat((ep * 0.97).toFixed(2));
+        : parseFloat((ep * 0.97).toFixed(2)));
       openPositions[sym] = {
         sym, qty, entry: ep, stop,
         entryDate: new Date().toISOString().slice(0,10),
         maxPrice: ep, minPrice: ep,
         be: false, runner: false, system, ts: Date.now(), synced: true,
       };
-      synced.push({ sym, side, qty, entry: ep, stop, system });
+      synced.push({ sym, side, qty, entry: ep, stop, system, stopReal: realStop !== null });
     }
+    saveState();
     if (synced.length > 0) {
       await sendTelegram(
         `📊 <b>Posiciones sincronizadas</b>\n\n` +
@@ -1436,197 +1630,10 @@ app.get('/alpaca/snapshots', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════
-// ENDPOINTS ADICIONALES — v3.4.1
-// ═══════════════════════════════════════════════════════
-
-// ── WATCHLIST DINÁMICA ───────────────────────────────────
-app.get('/watchlist/dynamic', (req, res) => {
-  res.json({ dynamic: dynWatchlist });
-});
-app.post('/watchlist/dynamic', (req, res) => {
-  const { sym } = req.body;
-  if (!sym) return res.status(400).json({ error: 'sym required' });
-  if (!dynWatchlist.find(x => x.sym === sym)) {
-    dynWatchlist.push({ sym: sym.toUpperCase(), ts: Date.now() });
-  }
-  res.json({ ok: true, dynamic: dynWatchlist });
-});
-app.delete('/watchlist/dynamic/:sym', (req, res) => {
-  const sym = req.params.sym.toUpperCase();
-  dynWatchlist = dynWatchlist.filter(x => x.sym !== sym);
-  res.json({ ok: true, dynamic: dynWatchlist });
-});
-
-// ── LAB — HIPÓTESIS ─────────────────────────────────────
-app.get('/lab/hypotheses', (req, res) => {
-  res.json(labHypotheses);
-});
-app.post('/lab/hypotheses', (req, res) => {
-  const h = req.body;
-  if (!h || !h.hypothesis) return res.status(400).json({ error: 'hypothesis required' });
-  const id = Date.now().toString();
-  const entry = {
-    id,
-    hypothesis: h.hypothesis,
-    category:   h.category   || 'general',
-    status:     h.status     || 'pending',
-    created:    new Date().toISOString(),
-    notes:      h.notes      || '',
-  };
-  labHypotheses.unshift(entry);
-  res.json({ ok: true, id, entry });
-});
-app.put('/lab/hypotheses/:id', (req, res) => {
-  const id  = req.params.id;
-  const idx = labHypotheses.findIndex(h => h.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'not found' });
-  labHypotheses[idx] = Object.assign(labHypotheses[idx], req.body, { id });
-  res.json({ ok: true, entry: labHypotheses[idx] });
-});
-app.delete('/lab/hypotheses/:id', (req, res) => {
-  const id  = req.params.id;
-  labHypotheses = labHypotheses.filter(h => h.id !== id);
-  res.json({ ok: true });
-});
-
-// ── LAB — REVIEWS ───────────────────────────────────────
-app.get('/lab/reviews', (req, res) => {
-  res.json(labReviews);
-});
-app.post('/lab/reviews', (req, res) => {
-  const r = req.body;
-  const id = Date.now().toString();
-  const entry = {
-    id,
-    title:     r.title    || 'Review',
-    content:   r.content  || '',
-    created:   new Date().toISOString(),
-    decisions: r.decisions || '',
-  };
-  labReviews.unshift(entry);
-  res.json({ ok: true, id, entry });
-});
-
-// ── TRADES — STATS DB ────────────────────────────────────
-app.get('/trades/stats/db', (req, res) => {
-  const days  = parseInt(req.query.days) || 30;
-  const since = Date.now() - days * 24 * 60 * 60 * 1000;
-  const recent = tradeHistory.filter(t => new Date(t.exitDate || t.date).getTime() >= since);
-  const wins   = recent.filter(t => t.pnl > 0);
-  const losses = recent.filter(t => t.pnl <= 0);
-  const grossW = wins.reduce((s,t) => s+t.pnl, 0);
-  const grossL = Math.abs(losses.reduce((s,t) => s+t.pnl, 0));
-  res.json({
-    days, n: recent.length,
-    wins: wins.length, losses: losses.length,
-    wr:    recent.length ? (wins.length/recent.length*100).toFixed(1) : 0,
-    pf:    grossL > 0 ? (grossW/grossL).toFixed(2) : null,
-    pnl:   recent.reduce((s,t) => s+t.pnl, 0).toFixed(2),
-    grossW: grossW.toFixed(2),
-    grossL: grossL.toFixed(2),
-  });
-});
-
-// ── TRADES — DECISIONS ───────────────────────────────────
-app.get('/trades/decisions', (req, res) => {
-  const limit  = parseInt(req.query.limit) || 50;
-  const recent = tradeHistory.slice(0, limit).map(t => ({
-    ...t, decisions: t.reason || '',
-  }));
-  res.json(recent);
-});
-
-// ── NOTICIAS — Alpaca ────────────────────────────────────
-app.get('/alpaca/news', async (req, res) => {
-  try {
-    const { syms, limit = 10 } = req.query;
-    if (!syms) return res.json([]);
-    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=${limit}`, { headers: alpacaHdr() });
-    const d = await r.json();
-    res.json(d.news || d || []);
-  } catch(e) { res.json([]); }
-});
-
-// ── NOTICIAS — Headlines ─────────────────────────────────
-app.get('/news/headlines', async (req, res) => {
-  try {
-    const { syms } = req.query;
-    if (!syms) return res.json([]);
-    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=20`, { headers: alpacaHdr() });
-    const d = await r.json();
-    res.json(d.news || d || []);
-  } catch(e) { res.json([]); }
-});
-
-// ── SCANNER MOM ──────────────────────────────────────────
-app.get('/scan/mom', (req, res) => {
-  try {
-    const limit   = parseInt(req.query.limit) || 30;
-    const results = UNIVERSE.slice(0, limit)
-      .filter(sym => !openPositions[sym])
-      .map(sym => ({ sym, inUniverse: true, open: false }));
-    res.json(results);
-  } catch(e) { res.json([]); }
-});
-
-// ── ALPACA — CUENTA ACTIVA ───────────────────────────────
-app.get('/alpaca/active', (req, res) => {
-  res.json({
-    account: ACTIVE_ACCOUNT,
-    label:   getAcc().label,
-    base:    alpacaBase(),
-    isLive:  isLive(),
-  });
-});
-
-// ── ALPACA — CAMBIAR CUENTA ──────────────────────────────
-app.post('/alpaca/switch', (req, res) => {
-  const { account } = req.body;
-  if (!account || !ALPACA_ACCOUNTS[account])
-    return res.status(400).json({ error: 'Invalid account. Use: paper2 or live' });
-  ACTIVE_ACCOUNT = account;
-  console.log(`[ACCOUNT] Cambiado a: ${getAcc().label}`);
-  res.json({ ok: true, account: ACTIVE_ACCOUNT, label: getAcc().label });
-});
-
-// ── ALPACA — ÓRDENES MANUALES ────────────────────────────
-app.post('/alpaca/order', async (req, res) => {
-  try {
-    const { sym, qty, side, type = 'market', tif = 'day' } = req.body;
-    if (!sym || !qty || !side) return res.status(400).json({ error: 'sym, qty, side required' });
-    const order = { symbol: sym, qty: String(qty), side, type, time_in_force: tif };
-    const r = await fetch(`${alpacaBase()}/v2/orders`, {
-      method: 'POST', headers: alpacaHdr(), body: JSON.stringify(order),
-    });
-    const d = await r.json();
-    if (d.id) {
-      console.log(`[ORDER] ${side} ${qty} ${sym} → ${d.id}`);
-      await sendTelegram(`📋 <b>Orden manual</b>\n${side.toUpperCase()} ${qty} ${sym}\nID: ${d.id}`);
-    }
-    res.json(d);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── TELEGRAM — enviar mensaje manual ────────────────────
-app.post('/telegram', async (req, res) => {
-  try {
-    const { text, message } = req.body;
-    const msg = text || message || '';
-    if (!msg) return res.status(400).json({ error: 'text required' });
-    await sendTelegram(msg);
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── IBKR — stubs (no conectado en V3) ───────────────────
-app.get('/ibkr/status',    (req, res) => res.json({ connected: false, message: 'IBKR no conectado en V3' }));
-app.get('/ibkr/positions', (req, res) => res.json([]));
-
-// ═══════════════════════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.4.1 — puerto ${PORT}`);
+  console.log(`ORS V3.4.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
@@ -1644,10 +1651,18 @@ app.listen(PORT, async () => {
     `Auto: ${AUTO_EXECUTE}`
   );
   setTimeout(updateRegime, 3000);
+  loadState(); // F8: restaurar estado antes del sync
   setTimeout(async () => {
     try {
-      const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
-      const positions = await r.json();
+      const [posRes, ordRes] = await Promise.all([
+        fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() }).then(r=>r.json()),
+        fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers:alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+      ]);
+      const positions = posRes;
+      const stopBySym = {};
+      (Array.isArray(ordRes) ? ordRes : []).forEach(o => {
+        if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+      });
       if (Array.isArray(positions) && positions.length) {
         const synced = [];
         positions.forEach(p => {
@@ -1655,32 +1670,40 @@ app.listen(PORT, async () => {
             const ep   = parseFloat(p.avg_entry_price);
             const side = p.side;
             const system = side === 'short' ? 'SHORT' : 'MOM';
-            const stop = side === 'short'
+            // F9: usar el stop GTC REAL que sigue vivo en el broker.
+            // Solo si no existe, fallback ±3% con aviso explícito.
+            const realStop = stopBySym[p.symbol]
+              ? parseFloat(stopBySym[p.symbol].stop_price) : null;
+            const stop = realStop !== null ? realStop : (side === 'short'
               ? parseFloat((ep*1.03).toFixed(2))
-              : parseFloat((ep*0.97).toFixed(2));
+              : parseFloat((ep*0.97).toFixed(2)));
             openPositions[p.symbol] = {
               sym:p.symbol, qty:Math.abs(parseInt(p.qty)), entry:ep, stop,
               entryDate: new Date().toISOString().slice(0,10),
               maxPrice:ep, minPrice:ep, be:false, runner:false,
               system, ts:Date.now(), synced:true,
             };
-            synced.push(p.symbol);
+            synced.push(p.symbol + (realStop !== null ? '' : '(stop inventado ±3% ⚠️)'));
           }
         });
         if (synced.length) {
           console.log(`[SYNC] ${synced.length} posiciones: ${synced.join(', ')}`);
           await sendTelegram(`📊 <b>Posiciones al arrancar:</b> ${synced.join(', ')}`);
         }
+        saveState();
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
   setInterval(checkMOMSignals,   5*60*1000);
   setInterval(checkShortSignals, 5*60*1000);
   setInterval(managePositions,   3*60*1000);
+  setInterval(reconcilePositions, 5*60*1000); // F6
+  setInterval(saveState,          5*60*1000); // F8
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
   setTimeout(checkMOMSignals,    30*1000);
   setTimeout(checkShortSignals,  35*1000);
+  setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
   function scheduleSector() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
