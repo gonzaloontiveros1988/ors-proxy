@@ -1,4 +1,4 @@
-// server.js — v3.5.5
+// server.js — v3.5.6
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -1382,7 +1382,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.5', version: '3.5.5',
+  status: 'ORS V3.5.6', version: '3.5.6',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1390,7 +1390,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.5.5',
+  status: 'ok', version: '3.5.6',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1404,16 +1404,41 @@ app.get('/health', (req, res) => res.json({
 app.get('/regime',    (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
 app.get('/trades', (req, res) => {
-  const wins = tradeHistory.filter(t=>t.win);
-  const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
-  const gl   = Math.abs(tradeHistory.filter(t=>!t.win).reduce((s,t)=>s+(t.pnlEur||0),0));
-  res.json({
-    summary: { n:tradeHistory.length,
-      wr: tradeHistory.length ? Math.round(wins.length/tradeHistory.length*100) : 0,
-      pf: gl>0 ? parseFloat((gw/gl).toFixed(2)) : 0,
-      pnl: Math.round(gw-gl) },
-    trades: tradeHistory.slice(0,50),
-  });
+  const limit = parseInt(req.query.limit) || 200;
+  // Incluir posiciones abiertas actuales como trades con status='open'
+  const openTrades = Object.entries(openPositions).map(([sym, pos]) => ({
+    id:           `OPEN_${sym}_${pos.edate}`,
+    sym:          sym,
+    ticker:       sym,
+    system:       pos.system || 'MOM',
+    module:       pos.system || 'MOM',
+    status:       'open',
+    entry_date:   pos.edate,
+    entry_price:  pos.entry,
+    stop:         pos.stop,
+    qty:          pos.qty,
+    pnl_eur:      null,
+    win:          null,
+    reason:       null,
+    be_active:    pos.be || false,
+    runner:       pos.runner || false,
+  }));
+  // Trades cerrados del historial
+  const closedTrades = tradeHistory.slice(0, limit).map(t => ({
+    ...t,
+    id:          t.id || `${t.sym}_${t.exitDate||t.date}`,
+    ticker:      t.sym,
+    module:      t.system || 'MOM',
+    status:      'closed',
+    entry_date:  t.date,
+    exit_date:   t.exitDate,
+    entry_price: t.entry,
+    exit_price:  t.exit,
+    pnl_eur:     t.pnlEur || t.pnl || 0,
+    win:         t.win,
+  }));
+  // Devolver array directo (no objeto wrapeado)
+  res.json([...openTrades, ...closedTrades]);
 });
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
@@ -1809,7 +1834,7 @@ app.get('/ibkr/positions', (req, res) => res.json([]));
 app.get('/debug/env', (req, res) => {
   const acc = getAcc();
   res.json({
-    version: '3.5.5',
+    version: '3.5.6',
     active_account: ACTIVE_ACCOUNT,
     key_defined:    !!acc.key,
     key_prefix:     (acc.key||'').slice(0,6),
@@ -1832,7 +1857,7 @@ app.get('/debug/env', (req, res) => {
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.5.5 — puerto ${PORT}`);
+  console.log(`ORS V3.5.6 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
