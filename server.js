@@ -1,5 +1,4 @@
-
-// server.js — v3.5.4
+// server.js — v3.5.5
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -62,9 +61,9 @@ const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
 const ALPACA_DATA = 'https://data.alpaca.markets';
 const ALPACA_ACCOUNTS = {
   paper2: {
-    key:    process.env.ALPACA_KEY_2      || process.env.ALPACA_PAPER_KEY    || process.env.ALPACA_KEY    || '',
-    secret: process.env.ALPACA_SECRET_2   || process.env.ALPACA_PAPER_SECRET || process.env.ALPACA_SECRET || '',
-    base:   process.env.ALPACA_BASE_2     || process.env.ALPACA_PAPER_URL    || process.env.ALPACA_BASE   || 'https://paper-api.alpaca.markets',
+    key:    process.env.ALPACA_KEY_2      || process.env.ALPACA_PAPER_KEY    || process.env.ALPACA_KEY_ID  || process.env.ALPACA_KEY    || '',
+    secret: process.env.ALPACA_SECRET_2   || process.env.ALPACA_PAPER_SECRET || process.env.ALPACA_SECRETS || process.env.ALPACA_SECRET || '',
+    base:   process.env.ALPACA_BASE_2     || process.env.ALPACA_PAPER_URL    || process.env.ALPACA_BASE    || 'https://paper-api.alpaca.markets',
     label:  '📊 PAPER €11k',
   },
   live: {
@@ -264,16 +263,7 @@ function calcSMA(prices, n) {
   return prices.slice(-n).reduce((a, b) => a + b, 0) / n;
 }
 
-// ── Helper: parsea JSON de forma segura, nunca crashea ──
-async function safeJson(response, fallback = null) {
-  try {
-    const text = await response.text();
-    if (!text || text.trim().startsWith('<')) return fallback;
-    return JSON.parse(text);
-  } catch(e) { return fallback; }
-}
-
-
+// ── v3.4.0: VPOC — Volume Point of Control ──────────────
 // Nivel de precio con más volumen acumulado en últimas N barras 15min
 // Grupos de $0.05 — donde instituciones compraron más
 function calcVPOC(bars, nBars) {
@@ -372,7 +362,7 @@ async function fetchDailyBars(sym, limit = 220) {
 async function fetchSnapshot(sym) {
   try {
     const r    = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${sym}&feed=iex`, { headers: alpacaHdr() });
-    const d = await safeJson(r, {});
+    const d    = await r.json();
     const snap = d[sym];
     if (!snap) return null;
     const lt   = snap.latestTrade || {};
@@ -685,7 +675,7 @@ async function waitForFill(orderId, maxSecs = 10) {
   for (let i = 0; i < maxSecs; i++) {
     try {
       const o = await fetch(`${alpacaBase()}/v2/orders/${orderId}`,
-        { headers: alpacaHdr() }).then(r => safeJson(r, []));
+        { headers: alpacaHdr() }).then(r => r.json());
       if (o.status === 'filled') {
         return { price: parseFloat(o.filled_avg_price), qty: parseFloat(o.filled_qty) };
       }
@@ -713,7 +703,7 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
         stop_loss:{ stop_price:String(stop) },
       }),
     });
-    const o = await safeJson(r, {});
+    const o = await r.json();
     if (!o.id) {
       await sendTelegram(`❌ Error Alpaca ${sym}: ${o.message || JSON.stringify(o).slice(0,100)}`);
       return false;
@@ -778,7 +768,7 @@ async function executeSell(sym, qty, reason, price) {
     }
 
     const openOrds = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
-      { headers:alpacaHdr() }).then(r => safeJson(r, [])).catch(() => []);
+      { headers:alpacaHdr() }).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
         { method:'DELETE', headers:alpacaHdr() }).catch(() => {});
@@ -790,7 +780,7 @@ async function executeSell(sym, qty, reason, price) {
       body: JSON.stringify({ symbol:sym, qty:String(qty), side,
         type:'market', time_in_force:'day' }),
     });
-    const o = await safeJson(r, {});
+    const o = await r.json();
     if (!o.id) return false;
     // F3: usar fill real también en la salida
     const fill = await waitForFill(o.id, 10);
@@ -823,7 +813,7 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
     const openOrds = await fetch(
       `${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers: alpacaHdr() }
-    ).then(r => safeJson(r, [])).catch(() => []);
+    ).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       if (ord.type === 'stop' || ord.type === 'stop_limit') {
         await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
@@ -839,7 +829,7 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
         time_in_force: 'gtc',
       }),
     });
-    const o = await safeJson(r, {});
+    const o = await r.json();
     if (o.id) {
       console.log(`[STOP] ✅ ${sym} stop → $${newStop}`);
       return true;
@@ -1037,7 +1027,7 @@ async function checkShortSignals() {
             type:'market', time_in_force:'gtc',
             order_class:'oto', stop_loss:{ stop_price:String(stop) } }),
         });
-        const o = await safeJson(r, {});
+        const o = await r.json();
         if (o.id) {
           const fill = await waitForFill(o.id, 10);
           const entryReal = (fill && fill.price) ? fill.price : entry;
@@ -1116,8 +1106,8 @@ async function managePositions() {
 async function reconcilePositions() {
   try {
     const [posRes, ordRes] = await Promise.all([
-      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>safeJson(r,[])).catch(()=>[]),
-      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>safeJson(r,[])).catch(()=>[]),
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
     ]);
     const alpacaPos = Array.isArray(posRes) ? posRes : [];
     const orders    = Array.isArray(ordRes) ? ordRes : [];
@@ -1211,7 +1201,7 @@ async function updateSectorSentiment() {
         }],
       }),
     });
-    const d = await safeJson(r, {});
+    const d    = await r.json();
     const text = (d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
     const j1 = text.indexOf('{'), j2 = text.lastIndexOf('}');
     if (j1 >= 0 && j2 >= 0) {
@@ -1234,7 +1224,7 @@ async function sendTelegram(msg) {
       method:'POST', headers:{ 'Content-Type':'application/json' },
       body: JSON.stringify({ chat_id:TG_CHAT, text:msg, parse_mode:'HTML' }),
     });
-    const d = await safeJson(r, {});
+    const d = await r.json();
     return d.ok;
   } catch(e) { return false; }
 }
@@ -1392,7 +1382,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.4', version: '3.5.4',
+  status: 'ORS V3.5.5', version: '3.5.5',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1400,7 +1390,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.5.4',
+  status: 'ok', version: '3.5.5',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1453,7 +1443,7 @@ app.post('/sector/run', async (req, res) => {
 app.get('/sync', async (req, res) => {
   try {
     const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
-    const alpacaPositions = await safeJson(r, []);
+    const alpacaPositions = await r.json();
     res.json({
       alpaca: Array.isArray(alpacaPositions) ? alpacaPositions.map(p => ({
         sym: p.symbol, side: p.side, qty: p.qty,
@@ -1469,8 +1459,8 @@ app.get('/sync', async (req, res) => {
 app.post('/sync', async (req, res) => {
   try {
     const [posRes, ordRes] = await Promise.all([
-      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>safeJson(r,[])),
-      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>safeJson(r,[])).catch(()=>[]),
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
     ]);
     const positions = posRes;
     if (!Array.isArray(positions))
@@ -1533,7 +1523,7 @@ app.post('/sync/history', async (req, res) => {
       `${alpacaBase()}/v2/orders?status=closed&after=${after}&limit=200&direction=desc`,
       { headers: alpacaHdr() }
     );
-    const orders = await safeJson(r, []);
+    const orders = await r.json();
     if (!Array.isArray(orders))
       return res.status(500).json({ error: 'Error Alpaca orders', raw: orders });
     const filled = orders.filter(o => o.status === 'filled');
@@ -1589,7 +1579,7 @@ app.post('/claude', async (req, res) => {
       headers:{ 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' },
       body: JSON.stringify(req.body),
     });
-    safeJson(r, {}).then(d => res.json(d));
+    res.json(await r.json());
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/yahoo', async (req, res) => {
@@ -1627,7 +1617,7 @@ app.get('/alpaca/bars/daily', async (req, res) => {
   try {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
-    const d = await safeJson(r, {});
+    const d   = await r.json();
     if (!d.bars) return res.json({ sym, bars: [], count: 0 });
     const bars = d.bars.map(b => ({
       t: b.t.slice(0, 10), o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0,
@@ -1748,7 +1738,7 @@ app.get('/alpaca/news', async (req, res) => {
     const { syms, limit = 10 } = req.query;
     if (!syms) return res.json([]);
     const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=${limit}`, { headers: alpacaHdr() });
-    const d = await safeJson(r, {});
+    const d = await r.json();
     res.json(d.news || d || []);
   } catch(e) { res.json([]); }
 });
@@ -1757,7 +1747,7 @@ app.get('/news/headlines', async (req, res) => {
     const { syms } = req.query;
     if (!syms) return res.json([]);
     const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=20`, { headers: alpacaHdr() });
-    const d = await safeJson(r, {});
+    const d = await r.json();
     res.json(d.news || d || []);
   } catch(e) { res.json([]); }
 });
@@ -1792,7 +1782,7 @@ app.post('/alpaca/order', async (req, res) => {
       method: 'POST', headers: alpacaHdr(),
       body: JSON.stringify({ symbol: sym, qty: String(qty), side, type, time_in_force: tif }),
     });
-    const d = await safeJson(r, {});
+    const d = await r.json();
     if (d.id) {
       console.log(`[ORDER] ${side} ${qty} ${sym} → ${d.id}`);
       await sendTelegram(`📋 <b>Orden manual</b>\n${side.toUpperCase()} ${qty} ${sym}\nID: ${d.id}`);
@@ -1815,11 +1805,34 @@ app.post('/telegram', async (req, res) => {
 app.get('/ibkr/status',    (req, res) => res.json({ connected: false, message: 'IBKR no conectado en V3' }));
 app.get('/ibkr/positions', (req, res) => res.json([]));
 
+// ── DEBUG — verificar variables de entorno ───────────────
+app.get('/debug/env', (req, res) => {
+  const acc = getAcc();
+  res.json({
+    version: '3.5.5',
+    active_account: ACTIVE_ACCOUNT,
+    key_defined:    !!acc.key,
+    key_prefix:     (acc.key||'').slice(0,6),
+    secret_defined: !!acc.secret,
+    base:           acc.base,
+    env_keys: {
+      ALPACA_KEY_2:      !!(process.env.ALPACA_KEY_2),
+      ALPACA_SECRET_2:   !!(process.env.ALPACA_SECRET_2),
+      ALPACA_BASE_2:     process.env.ALPACA_BASE_2 || 'NOT SET',
+      ALPACA_PAPER_KEY:  !!(process.env.ALPACA_PAPER_KEY),
+      ALPACA_PAPER_SECRET: !!(process.env.ALPACA_PAPER_SECRET),
+      ALPACA_PAPER_URL:  process.env.ALPACA_PAPER_URL || 'NOT SET',
+      ALPACA_KEY_ID:     !!(process.env.ALPACA_KEY_ID),
+      ALPACA_SECRETS:    !!(process.env.ALPACA_SECRETS),
+    }
+  });
+});
+
 // ═══════════════════════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.5.4 — puerto ${PORT}`);
+  console.log(`ORS V3.5.5 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
   await sendTelegram(
@@ -1841,8 +1854,8 @@ app.listen(PORT, async () => {
   setTimeout(async () => {
     try {
       const [posRes, ordRes] = await Promise.all([
-        fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() }).then(r=>safeJson(r,[])),
-        fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers:alpacaHdr() }).then(r=>safeJson(r,[])).catch(()=>[]),
+        fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() }).then(r=>r.json()),
+        fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers:alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
       ]);
       const positions = posRes;
       const stopBySym = {};
