@@ -1830,6 +1830,165 @@ app.post('/telegram', async (req, res) => {
 app.get('/ibkr/status',    (req, res) => res.json({ connected: false, message: 'IBKR no conectado en V3' }));
 app.get('/ibkr/positions', (req, res) => res.json([]));
 
+// ═══════════════════════════════════════════════════════
+// ANÁLISIS IA — Capitol Trades + Noticias + Claude
+// v3.6.0: endpoint unificado /analisis-ticker/:sym
+// Combina señal CT (Quiver Quantitative) + noticias
+// (Alpaca News) + análisis Claude en una sola llamada.
+// Variables de entorno opcionales:
+//   QUIVER_API_KEY — Quiver Quantitative (gratuita)
+// Sin keys: el análisis Claude funciona igual pero sin CT
+// ═══════════════════════════════════════════════════════
+
+async function fetchCapitolTradesQuiver(ticker) {
+  const key = process.env.QUIVER_API_KEY || '';
+  if (!key) return { signal: 'NO_KEY', summary: 'QUIVER_API_KEY no configurada', trades: [] };
+  try {
+    const r = await fetch(
+      `https://api.quiverquant.com/beta/historical/congresstrading/${ticker}`,
+      { headers: { 'Accept': 'application/json', 'Authorization': `Token ${key}` } }
+    );
+    if (!r.ok) return { signal: 'NO_DATA', summary: `Quiver HTTP ${r.status}`, trades: [] };
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0)
+      return { signal: 'NEUTRAL', summary: 'Sin trades de congresistas registrados', trades: [] };
+
+    // Solo últimos 90 días con fecha de REPORTE (no transacción)
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 90);
+    const recent = data.filter(t => {
+      const d = new Date(t.ReportDate || t.Date || '');
+      return d >= cutoff;
+    });
+    if (recent.length === 0)
+      return { signal: 'NEUTRAL', summary: 'Sin trades reportados en últimos 90 días', trades: [] };
+
+    let compras = 0, ventas = 0;
+    const compradores = new Set(), vendedores = new Set();
+    const detalles = [];
+    recent.forEach(t => {
+      const tipo = (t.Transaction || '').toLowerCase();
+      const amt  = parseFloat(t.Amount || '15000') || 15000;
+      const pol  = t.Representative || t.Senator || 'Desconocido';
+      const fecha = (t.ReportDate || t.Date || '').slice(0, 10);
+      if (tipo.includes('purchase') || tipo.includes('buy')) {
+        compras += amt; compradores.add(pol);
+        detalles.push(`COMPRA: ${pol} ~$${amt.toLocaleString()} (reportado ${fecha})`);
+      } else if (tipo.includes('sale') || tipo.includes('sell')) {
+        ventas += amt; vendedores.add(pol);
+        detalles.push(`VENTA: ${pol} ~$${amt.toLocaleString()} (reportado ${fecha})`);
+      }
+    });
+
+    const neto = compras - ventas;
+    let signal, summary;
+    if      (neto > 50000 && compradores.size >= 2) { signal = 'BULLISH';      summary = `${compradores.size} congresistas compraron neto $${neto.toLocaleString()} (90d)`; }
+    else if (neto > 20000 && compradores.size >= 1) { signal = 'BULLISH_WEAK'; summary = `${compradores.size} congresista(s) compraron neto $${neto.toLocaleString()} (90d)`; }
+    else if (neto < -50000 && vendedores.size >= 2) { signal = 'BEARISH';      summary = `${vendedores.size} congresistas vendieron neto $${Math.abs(neto).toLocaleString()} (90d)`; }
+    else                                             { signal = 'NEUTRAL';      summary = `Actividad mixta: +$${compras.toLocaleString()} / -$${ventas.toLocaleString()}`; }
+
+    return { signal, summary, trades: detalles.slice(0, 5), n_comp: compradores.size, n_vend: vendedores.size };
+  } catch(e) {
+    return { signal: 'ERROR', summary: `Error CT: ${e.message}`, trades: [] };
+  }
+}
+
+async function fetchNoticiasAlpaca(ticker) {
+  try {
+    const r = await fetch(
+      `${ALPACA_DATA}/v1beta1/news?symbols=${ticker}&limit=5&sort=desc`,
+      { headers: alpacaHdr() }
+    );
+    const d = await r.json();
+    const news = (d.news || d || []).slice(0, 5);
+    if (!news.length) return { headlines: [], summary: 'Sin noticias recientes en Alpaca' };
+    const headlines = news.map(n => ({
+      title:   n.headline || n.title || '',
+      summary: (n.summary || '').slice(0, 120),
+      date:    (n.created_at || n.updated_at || '').slice(0, 10),
+      source:  n.source || '',
+    }));
+    return { headlines, summary: `${headlines.length} noticias recientes` };
+  } catch(e) {
+    return { headlines: [], summary: `Error noticias: ${e.message}` };
+  }
+}
+
+// GET /analisis-ticker/:sym?momentum=481&precio=124&sector=Tech&regimen=BULL
+app.get('/analisis-ticker/:sym', async (req, res) => {
+  const sym = (req.params.sym || '').toUpperCase();
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+
+  const { momentum, precio, sector, regimen, empresa } = req.query;
+
+  try {
+    // Paralelizar CT + noticias
+    const [ct, noticias] = await Promise.all([
+      fetchCapitolTradesQuiver(sym),
+      fetchNoticiasAlpaca(sym),
+    ]);
+
+    // Construir prompt para Claude
+    const ctSection = ct.signal !== 'NO_KEY'
+      ? `\nCAPITOL TRADES (últimos 90 días — fecha de reporte, sin look-ahead):\n  Señal: ${ct.signal}\n  ${ct.summary}\n${ct.trades.map(t=>'  '+t).join('\n')}`
+      : '\nCAPITOL TRADES: No disponible (configurar QUIVER_API_KEY)';
+
+    const newsSection = noticias.headlines.length
+      ? `\nNOTICIAS RECIENTES (Alpaca News):\n${noticias.headlines.map(h=>`  • [${h.date}] ${h.title} (${h.source})`).join('\n')}`
+      : '\nNOTICIAS: Sin noticias recientes';
+
+    const prompt = `Eres un analista cuantitativo experto en momentum investing (estrategia Jegadeesh-Titman 12-1).
+
+TICKER: ${sym}${empresa ? ` (${empresa})` : ''}
+MOMENTUM 12-1: ${momentum || 'N/A'}%
+PRECIO: $${precio || 'N/A'}
+SECTOR: ${sector || 'N/A'}
+RÉGIMEN MERCADO: ${regimen || 'BULL'}
+${ctSection}
+${newsSection}
+
+TAREA: Analiza si ${sym} es candidato sólido para el módulo de momentum mensual.
+El sistema selecciona los 10 tickers con mejor momentum 12-1 y los mantiene 1 mes.
+
+Evalúa brevemente:
+1. 📈 MOMENTUM: ¿Sostenible o pico especulativo?
+2. 🏛️ CAPITOL TRADES: ¿Confirma o contradice la tesis?
+3. 📰 NOTICIAS: ¿Catalizadores reales o ruido?
+4. ⚠️ RIESGOS: Top 2 riesgos para los próximos 30 días
+5. ✅ VEREDICTO: COMPRAR / VIGILAR / EVITAR (una palabra) + razón en una línea
+
+Responde en español. Máximo 180 palabras. Sé directo y concreto.`;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada' });
+
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const claudeData = await claudeRes.json();
+    const analisis = claudeData.content?.[0]?.text || 'Sin respuesta de Claude';
+
+    res.json({
+      sym,
+      momentum:       momentum || null,
+      precio:         precio   || null,
+      sector:         sector   || null,
+      capitol_trades: ct,
+      noticias:       noticias.headlines,
+      analisis_ia:    analisis,
+      timestamp:      new Date().toISOString(),
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── DEBUG — verificar variables de entorno ───────────────
 app.get('/debug/env', (req, res) => {
   const acc = getAcc();
@@ -1857,19 +2016,19 @@ app.get('/debug/env', (req, res) => {
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
 app.listen(PORT, async () => {
-  console.log(`ORS V3.5.6 — puerto ${PORT}`);
+  console.log(`ORS V3.6.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
-  console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
+  console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring) + /analisis-ticker (CT+News+IA)`);
   await sendTelegram(
-    `🚀 <b>ORS V3.4.0 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.6.0 arrancado</b>\n\n` +
     `BULL:    MOM (5) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
-    `<b>Mejoras v3.4.0:</b>\n` +
+    `<b>Nuevo v3.6.0:</b>\n` +
+    `✅ /analisis-ticker — CT + Noticias + IA\n` +
     `✅ I10: Stop bajo VPOC\n` +
     `✅ D03: Bloquear si SPY<-1%\n` +
-    `✅ N02: Wyckoff Spring\n` +
-    `📊 OOS: PF 3.59 MAR 10.58 DD 6.08%\n\n` +
+    `✅ N02: Wyckoff Spring\n\n` +
     `Cuenta: ${getAcc().label}\n` +
     `Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
     `Auto: ${AUTO_EXECUTE}`
