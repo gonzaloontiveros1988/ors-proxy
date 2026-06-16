@@ -1,4 +1,4 @@
-// server.js — v3.4.0
+// server.js — v3.5.6
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -8,7 +8,19 @@
 // v3.1.0: /sync + /sync/history endpoints
 // v3.4.0: COMB_FINAL — I10 (Stop VPOC) + D03 (SPY>-1%) + N02 (Wyckoff Spring)
 //         Backtest OOS confirmado: PF 3.59 MAR 10.58 DD 6.08%
+// v3.5.0: HARDENING DE EJECUCIÓN (sin cambios en lógica de señales):
+//   F1: Auth x-api-key en endpoints (activar con env PROXY_API_KEY)
+//   F2: Órdenes OTO (entrada+stop atómicos) — imposible posición sin stop
+//   F3: Fill real leído de Alpaca (waitForFill) — entry/riesgo con precio real
+//   F4: Guard anti doble-venta en executeSell (verifica posición en broker)
+//   F5: FIX CRÍTICO — cierre de SHORT usaba side:'sell' (aumentaba el corto)
+//       y P&L con signo invertido. Ahora buy-to-cover + P&L correcto.
+//   F6: reconcilePositions cada 5min (broker vs servidor + stops huérfanos)
+//   F7: nyOffset dinámico en isEntryAllowed (regla 30min sobrevive al invierno)
+//   F8: Persistencia de estado en state.json (posiciones/diario/monthlyTrades)
+//   F9: Sync de arranque lee stops REALES del broker (no inventa ±3%)
 'use strict';
+const fs = require('fs');
 const express = require('express');
 const app = express();
 app.use(express.json());
@@ -19,6 +31,19 @@ app.use(function(req, res, next) {
   res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
+});
+// ── F1: AUTH ──────────────────────────────────────────
+// Activar definiendo PROXY_API_KEY en Render. Mientras no esté definida,
+// el comportamiento es idéntico al anterior (para no romper el frontend
+// hasta que ORS-APP envíe el header x-api-key).
+const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
+const PUBLIC_PATHS  = ['/', '/health'];
+app.use(function(req, res, next) {
+  if (!PROXY_API_KEY) return next();
+  if (PUBLIC_PATHS.indexOf(req.path) !== -1) return next();
+  const k = req.headers['x-api-key'] || req.query.key;
+  if (k === PROXY_API_KEY) return next();
+  return res.status(401).json({ error: 'unauthorized' });
 });
 // ── CONFIG ────────────────────────────────────────────
 const PORT       = process.env.PORT       || 3000;
@@ -36,15 +61,15 @@ const AUTO_EXECUTE = process.env.AUTO_EXECUTE === 'true';
 const ALPACA_DATA = 'https://data.alpaca.markets';
 const ALPACA_ACCOUNTS = {
   paper2: {
-    key:    process.env.ALPACA_KEY_2    || process.env.ALPACA_KEY    || '',
-    secret: process.env.ALPACA_SECRET_2 || process.env.ALPACA_SECRET || '',
-    base:   process.env.ALPACA_BASE     || 'https://paper-api.alpaca.markets',
+    key:    process.env.ALPACA_KEY_2      || process.env.ALPACA_PAPER_KEY    || process.env.ALPACA_KEY_ID  || process.env.ALPACA_KEY    || '',
+    secret: process.env.ALPACA_SECRET_2   || process.env.ALPACA_PAPER_SECRET || process.env.ALPACA_SECRETS || process.env.ALPACA_SECRET || '',
+    base:   process.env.ALPACA_BASE_2     || process.env.ALPACA_PAPER_URL    || process.env.ALPACA_BASE    || 'https://paper-api.alpaca.markets',
     label:  '📊 PAPER €11k',
   },
   live: {
     key:    process.env.ALPACA_LIVE_KEY    || '',
     secret: process.env.ALPACA_LIVE_SECRET || '',
-    base:   'https://api.alpaca.markets',
+    base:   process.env.ALPACA_LIVE_URL    || 'https://api.alpaca.markets',
     label:  '💰 LIVE',
   },
 };
@@ -104,6 +129,36 @@ let sectorSentiment  = {};
 let sectorLastUpdate = null;
 // Cache SPY diario para D03
 let spyDailyCache = { changePct: 0, date: '', ts: 0 };
+// LAB y watchlist dinámica
+let labHypotheses = [];
+let labReviews    = [];
+let dynWatchlist  = [];
+
+// ── F8: PERSISTENCIA DE ESTADO ────────────────────────
+// Nota: en Render el disco se borra en cada deploy; esto protege frente a
+// reinicios del proceso. Para persistencia total entre deploys, montar un
+// disco persistente o exportar el diario periódicamente.
+const STATE_FILE = process.env.STATE_FILE || './state.json';
+function saveState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      openPositions,
+      tradeHistory: tradeHistory.slice(0, 500),
+      monthlyTrades,
+      savedAt: new Date().toISOString(),
+    }));
+  } catch(e) { console.log('[STATE] save:', e.message); }
+}
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (s.openPositions) Object.assign(openPositions, s.openPositions);
+    if (Array.isArray(s.tradeHistory)) tradeHistory = s.tradeHistory;
+    if (s.monthlyTrades) Object.assign(monthlyTrades, s.monthlyTrades);
+    console.log(`[STATE] Restaurado: ${Object.keys(openPositions).length} pos, ${tradeHistory.length} trades (guardado ${s.savedAt})`);
+  } catch(e) { console.log('[STATE] load:', e.message); }
+}
 
 // ═══════════════════════════════════════════════════════
 // INDICADORES
@@ -297,7 +352,9 @@ async function fetchDailyBars(sym, limit = 220) {
   try {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
-    const d   = await r.json();
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return null;
+    const d = JSON.parse(text);
     if (!d.bars) return null;
     return d.bars.map(b => ({ t:b.t.slice(0,10), o:b.o, h:b.h, l:b.l, c:b.c, v:b.v||0 }));
   } catch(e) { return null; }
@@ -581,66 +638,95 @@ async function manageShortExit(sym, pos, bar, date, dailyBars) {
 // ═══════════════════════════════════════════════════════
 // ALPACA EXECUTION
 // ═══════════════════════════════════════════════════════
-function isMarketOpen() {
-  const now     = new Date();
-  const utcDay  = now.getUTCDay();
-  if (utcDay === 0 || utcDay === 6) return false;
-  const nyOffset = (() => {
-    const nyStr = now.toLocaleString('en-US', { timeZone:'America/New_York',
-      hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false });
-    const [h, m] = nyStr.split(':').map(Number);
-    const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
-    const nyMins  = h*60 + m;
-    return Math.round((utcMins - nyMins) / 60);
-  })();
+function nyOffsetHours() {
+  const now   = new Date();
+  const nyStr = now.toLocaleString('en-US', { timeZone:'America/New_York',
+    hour:'2-digit', minute:'2-digit', hour12:false });
+  const [h, m]  = nyStr.split(':').map(Number);
   const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
-  const open    = 570 + Math.abs(nyOffset)*60;
-  const close   = 960 + Math.abs(nyOffset)*60;
+  let diff = utcMins - (h*60 + m);
+  if (diff < -720) diff += 1440;   // cruce de medianoche UTC
+  if (diff >  720) diff -= 1440;
+  return Math.round(diff / 60);
+}
+function isMarketOpen() {
+  const now    = new Date();
+  const utcDay = now.getUTCDay();
+  if (utcDay === 0 || utcDay === 6) return false;
+  const off     = Math.abs(nyOffsetHours());
+  const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
+  const open    = 570 + off*60;
+  const close   = 960 + off*60;
   return utcMins >= open && utcMins < close;
 }
 function isEntryAllowed() {
   if (!isMarketOpen()) return false;
-  const now      = new Date();
-  const nyOffset = 4;
-  const utcMins  = now.getUTCHours()*60 + now.getUTCMinutes();
-  const open     = 570 + nyOffset*60;
-  const close    = 960 + nyOffset*60;
+  // F7: offset dinámico (antes hardcodeado a 4 — la regla de 30min
+  // desaparecía en horario de invierno)
+  const off     = Math.abs(nyOffsetHours());
+  const now     = new Date();
+  const utcMins = now.getUTCHours()*60 + now.getUTCMinutes();
+  const open    = 570 + off*60;
+  const close   = 960 + off*60;
   return utcMins >= open + 30 && utcMins < close - 30;
 }
+// F3: esperar y leer el fill real de una orden (hasta maxSecs segundos)
+async function waitForFill(orderId, maxSecs = 10) {
+  for (let i = 0; i < maxSecs; i++) {
+    try {
+      const o = await fetch(`${alpacaBase()}/v2/orders/${orderId}`,
+        { headers: alpacaHdr() }).then(r => r.json());
+      if (o.status === 'filled') {
+        return { price: parseFloat(o.filled_avg_price), qty: parseFloat(o.filled_qty) };
+      }
+      if (['canceled','rejected','expired'].indexOf(o.status) !== -1) return null;
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return null;
+}
+
 async function executeBuy(sym, entry, stop, qty, meta = {}) {
   if (!isMarketOpen()) {
     await sendTelegram(`🚫 Orden bloqueada — mercado cerrado (${sym})`);
     return false;
   }
   try {
+    // F2: orden OTO — entrada market + stop GTC atómicos en el broker.
+    // Si Alpaca acepta la entrada, el stop existe por construcción.
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'buy',
-        type:'market', time_in_force:'day' }),
+      body: JSON.stringify({
+        symbol:sym, qty:String(qty), side:'buy',
+        type:'market', time_in_force:'gtc',
+        order_class:'oto',
+        stop_loss:{ stop_price:String(stop) },
+      }),
     });
     const o = await r.json();
     if (!o.id) {
       await sendTelegram(`❌ Error Alpaca ${sym}: ${o.message || JSON.stringify(o).slice(0,100)}`);
       return false;
     }
-    await new Promise(r => setTimeout(r, 1500));
-    await fetch(`${alpacaBase()}/v2/orders`, {
-      method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
-        type:'stop', stop_price:String(stop), time_in_force:'gtc' }),
-    });
-    const riskEur = Math.round((entry - stop) * qty / EUR_USD);
+    // F3: registrar con el precio de fill REAL, no el teórico
+    const fill = await waitForFill(o.id, 10);
+    const entryReal = (fill && fill.price) ? fill.price : entry;
+    if (!fill) await sendTelegram(`⚠️ ${sym}: sin confirmación de fill en 10s — registrado con precio teórico $${entry.toFixed(2)}. RECON lo corregirá.`);
+    const riskEur = Math.round((entryReal - stop) * qty / EUR_USD);
     openPositions[sym] = {
-      sym, qty, entry, stop, entryDate: new Date().toISOString().slice(0,10),
-      maxPrice: entry, minPrice: entry,
+      sym, qty, entry: entryReal, stop, entryDate: new Date().toISOString().slice(0,10),
+      maxPrice: entryReal, minPrice: entryReal,
       be:false, runner:false, system: meta.system || 'MOM',
       target: meta.target || null, ts: Date.now(),
+      orderId: o.id, entrySenal: entry,
     };
+    saveState();
     const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
+    const slipBps = entry > 0 ? Math.round((entryReal/entry - 1) * 10000) : 0;
     await sendTelegram(
       `✅ <b>${meta.system||'MOM'} EJECUTADO — ${sym}</b>\n${mode}\n\n` +
-      `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
-      `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
+      `💰 ${qty} acc @ $${entryReal.toFixed(2)} (señal $${entry.toFixed(2)} · slip ${slipBps>=0?'+':''}${slipBps}bps)\n` +
+      `🛑 Stop: $${stop} (OTO) · Riesgo: ~€${riskEur}\n` +
       (meta.target ? `🎯 Target: $${meta.target.toFixed(2)}\n` : '') +
       `\n/cerrar_${sym}`
     );
@@ -653,33 +739,66 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
 async function executeSell(sym, qty, reason, price) {
   if (!isMarketOpen() && !reason.toLowerCase().includes('stop')) return false;
   try {
+    const pos = openPositions[sym];
+    const isShortPos = pos && pos.system === 'SHORT';
+    // F5: P&L con signo correcto según dirección
+    const pnlOf = (exitPx) => pos
+      ? Math.round((isShortPos ? (pos.entry - exitPx) : (exitPx - pos.entry)) * qty / EUR_USD)
+      : 0;
+
+    // F4: guard anti doble-venta — ¿la posición sigue viva en el broker?
+    // Si el stop GTC de Alpaca ya se ejecutó, registrar y NO enviar orden
+    // (antes: se enviaba otra venta a mercado → corto accidental).
+    const chk = await fetch(`${alpacaBase()}/v2/positions/${sym}`, { headers: alpacaHdr() });
+    if (chk.status === 404) {
+      if (pos) {
+        const pnl = pnlOf(price);
+        tradeHistory.unshift({
+          sym, system: pos.system, entry: pos.entry, exit: price,
+          qty, pnlEur: pnl, win: pnl > 0,
+          entryDate: pos.entryDate, exitDate: new Date().toISOString().slice(0,10),
+          exitReason: 'StopBroker',
+        });
+        if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
+        delete openPositions[sym];
+        saveState();
+        await sendTelegram(`🛑 <b>${sym} ya cerrado por stop del broker</b>\nP&L estimado: ${pnlOf(price) >= 0 ? '+' : ''}€${pnlOf(price)}`);
+      }
+      return true;
+    }
+
     const openOrds = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers:alpacaHdr() }).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
       await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
         { method:'DELETE', headers:alpacaHdr() }).catch(() => {});
     }
+    // F5: para cerrar un SHORT se COMPRA (buy-to-cover), no se vende más
+    const side = isShortPos ? 'buy' : 'sell';
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
+      body: JSON.stringify({ symbol:sym, qty:String(qty), side,
         type:'market', time_in_force:'day' }),
     });
     const o = await r.json();
     if (!o.id) return false;
-    const pos = openPositions[sym];
-    const pnl = pos ? Math.round((price - pos.entry) * qty / EUR_USD) : 0;
+    // F3: usar fill real también en la salida
+    const fill = await waitForFill(o.id, 10);
+    const exitReal = (fill && fill.price) ? fill.price : price;
+    const pnl = pnlOf(exitReal);
     if (pos) {
       tradeHistory.unshift({
-        sym, system: pos.system, entry: pos.entry, exit: price,
+        sym, system: pos.system, entry: pos.entry, exit: exitReal,
         qty, pnlEur: pnl, win: pnl > 0,
         entryDate: pos.entryDate, exitDate: new Date().toISOString().slice(0,10),
         exitReason: reason,
       });
-      if (tradeHistory.length > 200) tradeHistory = tradeHistory.slice(0, 200);
+      if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
     }
     delete openPositions[sym];
+    saveState();
     await sendTelegram(
-      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ ~$${price.toFixed(2)}\n` +
+      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ $${exitReal.toFixed(2)} (${side})\n` +
       `Motivo: ${reason}\nP&L: ${pnl >= 0 ? '+' : ''}€${pnl}`
     );
     return true;
@@ -901,22 +1020,28 @@ async function checkShortSignals() {
     sentAlerts[key] = Date.now();
     if (AUTO_EXECUTE) {
       try {
+        // F2: OTO también en SHORT — entrada + stop de recompra atómicos
         const r = await fetch(`${alpacaBase()}/v2/orders`, {
           method:'POST', headers:alpacaHdr(),
           body: JSON.stringify({ symbol:sym, qty:String(qty), side:'sell',
-            type:'market', time_in_force:'day' }),
+            type:'market', time_in_force:'gtc',
+            order_class:'oto', stop_loss:{ stop_price:String(stop) } }),
         });
         const o = await r.json();
         if (o.id) {
-          openPositions[sym] = { sym, qty, entry, stop,
+          const fill = await waitForFill(o.id, 10);
+          const entryReal = (fill && fill.price) ? fill.price : entry;
+          openPositions[sym] = { sym, qty, entry: entryReal, stop,
             entryDate: new Date().toISOString().slice(0,10),
-            minPrice:entry, be:false, runner:false, system:'SHORT', ts:Date.now() };
+            minPrice:entryReal, be:false, runner:false, system:'SHORT',
+            ts:Date.now(), orderId:o.id, entrySenal:entry };
           monthlyTrades[`${sym}_short_${month}`] = true;
-          const riskEur = Math.round((stop - entry) * qty / EUR_USD);
+          saveState();
+          const riskEur = Math.round((stop - entryReal) * qty / EUR_USD);
           await sendTelegram(
             `📉 <b>SHORT EJECUTADO — ${sym}</b>\n\n` +
-            `💰 ${qty} acc @ ~$${entry.toFixed(2)}\n` +
-            `🛑 Stop: $${stop} · Riesgo: ~€${riskEur}\n` +
+            `💰 ${qty} acc @ $${entryReal.toFixed(2)}\n` +
+            `🛑 Stop: $${stop} (OTO) · Riesgo: ~€${riskEur}\n` +
             `📊 RSI ${sig.rsi} | RS ${sig.spyRS?.toFixed(1)}% vs SPY\n\n/cerrar_${sym}`
           );
         }
@@ -972,6 +1097,70 @@ async function managePositions() {
       await new Promise(r => setTimeout(r, 300));
     } catch(e) { console.log('[MANAGE]', sym, e.message); }
   }
+}
+
+// ═══════════════════════════════════════════════════════
+// F6: RECONCILIACIÓN BROKER ↔ SERVIDOR (cada 5 min)
+// El servidor deja de "creer" su estado: lo verifica contra Alpaca.
+// ═══════════════════════════════════════════════════════
+async function reconcilePositions() {
+  try {
+    const [posRes, ordRes] = await Promise.all([
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+    ]);
+    const alpacaPos = Array.isArray(posRes) ? posRes : [];
+    const orders    = Array.isArray(ordRes) ? ordRes : [];
+    const posBySym  = {};
+    alpacaPos.forEach(p => { posBySym[p.symbol] = p; });
+    const stopBySym = {};
+    orders.forEach(o => {
+      if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+    });
+
+    // 1) El servidor cree que está abierta pero el broker ya la cerró
+    //    (el stop GTC se ejecutó entre polls) → registrar trade y limpiar
+    for (const sym of Object.keys(openPositions)) {
+      if (!posBySym[sym]) {
+        const pos  = openPositions[sym];
+        const snap = await fetchSnapshot(sym).catch(() => null);
+        const px   = (snap && snap.price) ? snap.price : pos.stop;
+        const pnl  = Math.round(
+          (pos.system === 'SHORT' ? (pos.entry - px) : (px - pos.entry)) * pos.qty / EUR_USD
+        );
+        tradeHistory.unshift({
+          sym, system: pos.system, entry: pos.entry, exit: px, qty: pos.qty,
+          pnlEur: pnl, win: pnl > 0, entryDate: pos.entryDate,
+          exitDate: new Date().toISOString().slice(0,10), exitReason: 'StopBroker',
+        });
+        if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
+        delete openPositions[sym];
+        await sendTelegram(`🔄 <b>RECON: ${sym} cerrado en broker</b>\nStop GTC ejecutado · P&L estimado: ${pnl >= 0 ? '+' : ''}€${pnl}`);
+      }
+    }
+    // 2) Posición en el broker que el servidor no conoce → alertar
+    for (const p of alpacaPos) {
+      if (!openPositions[p.symbol]) {
+        await sendTelegram(`⚠️ <b>RECON: posición huérfana ${p.symbol}</b> (${p.qty} acc, ${p.side})\nUsa POST /sync para adoptarla.`);
+      }
+    }
+    // 3) Posición registrada SIN stop vivo en el broker → recolocar y alertar
+    for (const sym of Object.keys(openPositions)) {
+      if (posBySym[sym] && !stopBySym[sym]) {
+        const pos = openPositions[sym];
+        await sendTelegram(`🚨 <b>RECON: ${sym} SIN STOP en broker</b>\nRecolocando stop $${pos.stop}`);
+        await updateAlpacaStop(sym, pos.qty, pos.stop, pos.system === 'SHORT');
+      }
+    }
+    // 4) Diferencia de cantidad → alertar (fills parciales, intervención manual)
+    for (const sym of Object.keys(openPositions)) {
+      const p = posBySym[sym];
+      if (p && Math.abs(parseInt(p.qty)) !== openPositions[sym].qty) {
+        await sendTelegram(`⚠️ <b>RECON: qty difiere en ${sym}</b>\nServidor: ${openPositions[sym].qty} · Broker: ${Math.abs(parseInt(p.qty))}`);
+      }
+    }
+    saveState();
+  } catch(e) { console.log('[RECON]', e.message); }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1042,7 +1231,9 @@ async function sendTelegram(msg) {
 async function pollTelegram() {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId+1}&timeout=5`);
-    const d = await r.json();
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return;
+    const d = JSON.parse(text);
     if (!d.ok || !d.result.length) return;
     for (const update of d.result) {
       lastUpdateId = update.update_id;
@@ -1067,16 +1258,21 @@ async function pollTelegram() {
           const r2 = await fetch(`${alpacaBase()}/v2/orders`, {
             method:'POST', headers:alpacaHdr(),
             body: JSON.stringify({ symbol:sym, qty:String(order.qty), side:'sell',
-              type:'market', time_in_force:'day' }),
+              type:'market', time_in_force:'gtc',
+              order_class:'oto', stop_loss:{ stop_price:String(order.stop) } }),
           });
           const o = await r2.json();
           if (o.id) {
-            openPositions[sym] = { ...order, entryDate:new Date().toISOString().slice(0,10),
-              minPrice:order.entry, be:false, runner:false, ts:Date.now() };
+            const fill = await waitForFill(o.id, 10);
+            const entryReal = (fill && fill.price) ? fill.price : order.entry;
+            openPositions[sym] = { ...order, entry: entryReal,
+              entryDate:new Date().toISOString().slice(0,10),
+              minPrice:entryReal, be:false, runner:false, ts:Date.now(), orderId:o.id };
             const month = new Date().toISOString().slice(0,7);
             monthlyTrades[`${sym}_short_${month}`] = true;
             delete pendingOrders[sym];
-            await sendTelegram(`✅ SHORT ejecutado — ${sym} ${order.qty} acc`);
+            saveState();
+            await sendTelegram(`✅ SHORT ejecutado — ${sym} ${order.qty} acc @ $${entryReal.toFixed(2)} (stop OTO $${order.stop})`);
           }
         } else {
           await executeBuy(sym, order.entry, order.stop, order.qty,
@@ -1186,7 +1382,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.4.0', version: '3.4.0',
+  status: 'ORS V3.5.6', version: '3.6.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1194,7 +1390,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.4.0',
+  status: 'ok', version: '3.6.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -1205,19 +1401,45 @@ app.get('/health', (req, res) => res.json({
   account: ACTIVE_ACCOUNT,
   autoExecute: AUTO_EXECUTE,
 }));
-app.get('/regime',    (req, res) => res.json(MARKET_REGIME));
+app.get('/regime',        (req, res) => res.json(MARKET_REGIME));
+app.get('/market/regime', (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
 app.get('/trades', (req, res) => {
-  const wins = tradeHistory.filter(t=>t.win);
-  const gw   = wins.reduce((s,t)=>s+(t.pnlEur||0),0);
-  const gl   = Math.abs(tradeHistory.filter(t=>!t.win).reduce((s,t)=>s+(t.pnlEur||0),0));
-  res.json({
-    summary: { n:tradeHistory.length,
-      wr: tradeHistory.length ? Math.round(wins.length/tradeHistory.length*100) : 0,
-      pf: gl>0 ? parseFloat((gw/gl).toFixed(2)) : 0,
-      pnl: Math.round(gw-gl) },
-    trades: tradeHistory.slice(0,50),
-  });
+  const limit = parseInt(req.query.limit) || 200;
+  // Incluir posiciones abiertas actuales como trades con status='open'
+  const openTrades = Object.entries(openPositions).map(([sym, pos]) => ({
+    id:           `OPEN_${sym}_${pos.edate}`,
+    sym:          sym,
+    ticker:       sym,
+    system:       pos.system || 'MOM',
+    module:       pos.system || 'MOM',
+    status:       'open',
+    entry_date:   pos.edate,
+    entry_price:  pos.entry,
+    stop:         pos.stop,
+    qty:          pos.qty,
+    pnl_eur:      null,
+    win:          null,
+    reason:       null,
+    be_active:    pos.be || false,
+    runner:       pos.runner || false,
+  }));
+  // Trades cerrados del historial
+  const closedTrades = tradeHistory.slice(0, limit).map(t => ({
+    ...t,
+    id:          t.id || `${t.sym}_${t.exitDate||t.date}`,
+    ticker:      t.sym,
+    module:      t.system || 'MOM',
+    status:      'closed',
+    entry_date:  t.date,
+    exit_date:   t.exitDate,
+    entry_price: t.entry,
+    exit_price:  t.exit,
+    pnl_eur:     t.pnlEur || t.pnl || 0,
+    win:         t.win,
+  }));
+  // Devolver array directo (no objeto wrapeado)
+  res.json([...openTrades, ...closedTrades]);
 });
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
@@ -1262,10 +1484,17 @@ app.get('/sync', async (req, res) => {
 });
 app.post('/sync', async (req, res) => {
   try {
-    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
-    const positions = await r.json();
+    const [posRes, ordRes] = await Promise.all([
+      fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() }).then(r=>r.json()),
+      fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers: alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+    ]);
+    const positions = posRes;
     if (!Array.isArray(positions))
       return res.status(500).json({ error: 'Error Alpaca', raw: positions });
+    const stopBySym = {};
+    (Array.isArray(ordRes) ? ordRes : []).forEach(o => {
+      if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+    });
     const synced = [], skipped = [];
     for (const p of positions) {
       const sym = p.symbol;
@@ -1274,17 +1503,20 @@ app.post('/sync', async (req, res) => {
       const qty  = Math.abs(parseInt(p.qty));
       const side = p.side;
       const system = side === 'short' ? 'SHORT' : 'MOM';
-      const stop = side === 'short'
+      // F9: stop real del broker si existe; fallback ±3% marcado
+      const realStop = stopBySym[sym] ? parseFloat(stopBySym[sym].stop_price) : null;
+      const stop = realStop !== null ? realStop : (side === 'short'
         ? parseFloat((ep * 1.03).toFixed(2))
-        : parseFloat((ep * 0.97).toFixed(2));
+        : parseFloat((ep * 0.97).toFixed(2)));
       openPositions[sym] = {
         sym, qty, entry: ep, stop,
         entryDate: new Date().toISOString().slice(0,10),
         maxPrice: ep, minPrice: ep,
         be: false, runner: false, system, ts: Date.now(), synced: true,
       };
-      synced.push({ sym, side, qty, entry: ep, stop, system });
+      synced.push({ sym, side, qty, entry: ep, stop, system, stopReal: realStop !== null });
     }
+    saveState();
     if (synced.length > 0) {
       await sendTelegram(
         `📊 <b>Posiciones sincronizadas</b>\n\n` +
@@ -1384,16 +1616,26 @@ app.get('/yahoo', async (req, res) => {
       `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=${interval}&range=${range}`,
       { headers:{ 'User-Agent':'Mozilla/5.0' } }
     );
-    res.json(await r.json());
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    try { res.json(JSON.parse(text)); } catch(e) { res.json({}); }
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
-app.get('/alpaca/account',   async (req, res) => {
-  const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
-  res.json(await r.json());
+app.get('/alpaca/account', async (req, res) => {
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/account`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    try { res.json(JSON.parse(text)); } catch(e) { res.json({}); }
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/alpaca/positions', async (req, res) => {
-  const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
-  res.json(await r.json());
+  try {
+    const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json([]);
+    try { res.json(JSON.parse(text)); } catch(e) { res.json([]); }
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/alpaca/bars/daily', async (req, res) => {
   const { sym, limit = 504 } = req.query;
@@ -1417,209 +1659,510 @@ app.get('/alpaca/bars/15min', async (req, res) => {
     const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=15Min&limit=${limit}&feed=iex&sort=asc&start=${startDate}`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
-    if (!text || text === 'Not Found') return res.json({ sym, bars: [], prices15: [], count: 0 });
-    const d = JSON.parse(text);
+    if (!text || text === 'Not Found' || text.trim().startsWith('<'))
+      return res.json({ sym, bars: [], prices15: [], count: 0 });
+    let d;
+    try { d = JSON.parse(text); } catch(e) {
+      return res.json({ sym, bars: [], prices15: [], count: 0 });
+    }
     if (!d.bars) return res.json({ sym, bars: [], prices15: [], count: 0 });
     const bars = d.bars.map(b => ({ t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v || 0 }));
     res.json({ sym, bars, prices15: bars.map(b=>b.c), count: bars.length });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.json({ sym, bars: [], prices15: [], count: 0 }); }
 });
 app.get('/alpaca/snapshots', async (req, res) => {
   const { syms } = req.query;
   if (!syms) return res.json({});
-  const r = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${syms}&feed=iex`, { headers:alpacaHdr() });
-  res.json(await r.json());
+  try {
+    const r = await fetch(`${ALPACA_DATA}/v2/stocks/snapshots?symbols=${syms}&feed=iex`, { headers:alpacaHdr() });
+    const text = await r.text();
+    if (!text || text.trim().startsWith('<')) return res.json({});
+    res.json(JSON.parse(text));
+  } catch(e) { res.json({}); }
 });
 
 // ═══════════════════════════════════════════════════════
-// ANÁLISIS MACRO — Alerta temprana con IA
+// ENDPOINTS ADICIONALES — v3.5.1
 // ═══════════════════════════════════════════════════════
-let MACRO_CACHE = { ts:0, data:null, prob:0, regime:'BULL', last_tg:0 };
-const MACRO_TTL = { BULL:7*24*3600000, VIGILANCIA:24*3600000, ALERTA:6*3600000 };
 
-async function fetchMacroIndicators() {
-  const ind = {};
-  // SPY — precio, SMA50, SMA200, drawdown, momentum
-  try {
-    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=iex&sort=asc`, { headers:alpacaHdr() });
-    const d = await r.json();
-    const bars = (d.bars||[]).map(b=>b.c);
-    if (bars.length>=200) {
-      const last=bars[bars.length-1];
-      const sma50=bars.slice(-50).reduce((a,b)=>a+b,0)/50;
-      const sma200=bars.slice(-200).reduce((a,b)=>a+b,0)/200;
-      const max52=Math.max(...bars.slice(-252));
-      ind.spy = {
-        price:last.toFixed(2), sma50:sma50.toFixed(2), sma200:sma200.toFixed(2),
-        above_sma50:last>sma50, above_sma200:last>sma200,
-        drawdown_52w:((last-max52)/max52*100).toFixed(1),
-        mom_20d:((last-bars[bars.length-21])/bars[bars.length-21]*100).toFixed(1),
-        regime: last>sma200?(last>sma50?'BULL':'LATERAL'):'BEAR',
-      };
-    }
-  } catch(e){ ind.spy_error=e.message; }
+// ── WATCHLIST DINÁMICA ───────────────────────────────────
+app.get('/watchlist/dynamic', (req, res) => {
+  res.json({ dynamic: dynWatchlist });
+});
+app.post('/watchlist/dynamic', (req, res) => {
+  const { sym } = req.body;
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+  if (!dynWatchlist.find(x => x.sym === sym))
+    dynWatchlist.push({ sym: sym.toUpperCase(), ts: Date.now() });
+  res.json({ ok: true, dynamic: dynWatchlist });
+});
+app.delete('/watchlist/dynamic/:sym', (req, res) => {
+  dynWatchlist = dynWatchlist.filter(x => x.sym !== req.params.sym.toUpperCase());
+  res.json({ ok: true, dynamic: dynWatchlist });
+});
 
-  // VIX proxy (VIXY)
-  try {
-    const r = await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=iex&sort=asc`, { headers:alpacaHdr() });
-    const d = await r.json(); const bars=d.bars||[];
-    if (bars.length>=5) {
-      const last=bars[bars.length-1].c; const prev=bars[bars.length-6]?.c||last;
-      ind.vix = { level:last.toFixed(2), chg_5d:((last-prev)/prev*100).toFixed(1), elevated:last>20, spike:((last-prev)/prev*100)>20 };
-    }
-  } catch(e){}
+// ── LAB — HIPÓTESIS ─────────────────────────────────────
+app.get('/lab/hypotheses', (req, res) => res.json(labHypotheses));
+app.post('/lab/hypotheses', (req, res) => {
+  const h = req.body;
+  if (!h || !h.hypothesis) return res.status(400).json({ error: 'hypothesis required' });
+  const entry = { id: Date.now().toString(), hypothesis: h.hypothesis,
+    category: h.category || 'general', status: h.status || 'pending',
+    created: new Date().toISOString(), notes: h.notes || '' };
+  labHypotheses.unshift(entry);
+  res.json({ ok: true, id: entry.id, entry });
+});
+app.put('/lab/hypotheses/:id', (req, res) => {
+  const idx = labHypotheses.findIndex(h => h.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'not found' });
+  labHypotheses[idx] = Object.assign(labHypotheses[idx], req.body, { id: req.params.id });
+  res.json({ ok: true, entry: labHypotheses[idx] });
+});
+app.delete('/lab/hypotheses/:id', (req, res) => {
+  labHypotheses = labHypotheses.filter(h => h.id !== req.params.id);
+  res.json({ ok: true });
+});
 
-  // Yield curve proxy TLT/SHY
-  try {
-    const [r1,r2] = await Promise.all([
-      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
-      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
-    ]);
-    const [d1,d2] = await Promise.all([r1.json(),r2.json()]);
-    const tlt=(d1.bars||[]).slice(-1)[0]?.c; const shy=(d2.bars||[]).slice(-1)[0]?.c;
-    if (tlt&&shy) ind.yield_curve = { tlt_shy_ratio:(tlt/shy).toFixed(3), inverted:(tlt/shy)<1.1 };
-  } catch(e){}
+// ── LAB — REVIEWS ───────────────────────────────────────
+app.get('/lab/reviews', (req, res) => res.json(labReviews));
+app.post('/lab/reviews', (req, res) => {
+  const r = req.body;
+  const entry = { id: Date.now().toString(), title: r.title || 'Review',
+    content: r.content || '', created: new Date().toISOString(),
+    decisions: r.decisions || '' };
+  labReviews.unshift(entry);
+  res.json({ ok: true, id: entry.id, entry });
+});
 
-  // Sectores — rotación 20d
-  const secs = { QQQ:'Tech/Growth',XLV:'Health',XLE:'Energy',XLF:'Finance',XLU:'Utilities',GLD:'Gold' };
-  ind.sectores = {};
-  await Promise.all(Object.entries(secs).map(async ([sym,label]) => {
-    try {
-      const r = await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=iex&sort=asc`,{headers:alpacaHdr()});
-      const d = await r.json(); const bars=(d.bars||[]).map(b=>b.c);
-      if (bars.length>=20) {
-        const last=bars[bars.length-1];
-        ind.sectores[sym] = { label, price:last.toFixed(2), mom_20d:((last-bars[0])/bars[0]*100).toFixed(1), mom_5d:((last-bars[bars.length-6])/bars[bars.length-6]*100).toFixed(1) };
-      }
-    } catch(e){}
-  }));
-
-  // Noticias macro
-  try {
-    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=SPY,QQQ,TLT&limit=8&sort=desc`,{headers:alpacaHdr()});
-    const d = await r.json();
-    ind.noticias = (d.news||d||[]).slice(0,6).map(n=>({ title:n.headline||n.title||'', date:(n.created_at||'').slice(0,10) }));
-  } catch(e){ ind.noticias=[]; }
-
-  ind.timestamp = new Date().toISOString();
-  return ind;
-}
-
-async function analyzeWithClaude(ind) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  const spy=ind.spy||{}; const vix=ind.vix||{}; const yc=ind.yield_curve||{};
-  const secs=ind.sectores||{}; const news=ind.noticias||[];
-  const secStr=Object.entries(secs).map(([s,d])=>`${s}:20d=${d.mom_20d}% 5d=${d.mom_5d}%`).join(' | ');
-  const newsStr=news.slice(0,4).map(n=>`• ${n.title} [${n.date}]`).join('\n');
-  const prompt = `Eres analista macro cuantitativo experto en crashes de mercado.
-
-INDICADORES ACTUALES:
-SPY $${spy.price} | SMA50 $${spy.sma50} | SMA200 $${spy.sma200} | Régimen: ${spy.regime} | DD52w: ${spy.drawdown_52w}% | Mom20d: ${spy.mom_20d}%
-VIX proxy: $${vix.level} | Chg5d: ${vix.chg_5d}% | Elevado: ${vix.elevated} | Spike: ${vix.spike}
-Yield curve TLT/SHY: ${yc.tlt_shy_ratio} | Invertida: ${yc.inverted}
-Sectores 20d: ${secStr}
-Noticias: ${newsStr}
-Contexto: Fed 3.50-3.75% pausa hawkish jun 2026 | Prima riesgo S&P ~0.02% mínimo histórico
-
-TAXONOMÍA DE CRASHES (para clasificar):
-Tipo A (repricing múltiplos): Fed hawkish, tipos suben, caída gradual meses
-Tipo B (liquidez): desapalancamiento forzado, V-shape días/semanas
-Tipo C (político): decisión política, dependiente de noticias
-
-Responde SOLO JSON sin texto adicional:
-{"regime":"BULL|LATERAL|BEAR|ALERTA|PRE-CRASH","prob_crash_30d":0-100,"crash_type_potencial":"A_REPRICING|B_LIQUIDEZ|C_POLITICO|NINGUNO","señales_positivas":["max 3"],"señales_negativas":["max 3"],"indicadores_clave":{"spy_regime":"BULL/LATERAL/BEAR","vix_status":"NORMAL/ELEVADO/SPIKE","yield_curve":"NORMAL/PLANA/INVERTIDA","rotacion_sectorial":"RISK-ON/NEUTRAL/RISK-OFF","momentum_macro":"POSITIVO/NEUTRO/NEGATIVO"},"comparativa_historica":"C1_2022|C3_2024|C4_2025|SIN_PARALELISMO","resumen":"2-3 frases en español","recomendacion_jt":"OPERAR_NORMAL|MODO_ALERTA|REDUCIR_EXPOSICION|SALIR_CASH","proxima_revision":"SEMANAL|DIARIA|6H"}`;
-
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method:'POST',
-    headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
-    body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:800, messages:[{role:'user',content:prompt}] }),
+// ── TRADES — STATS DB ────────────────────────────────────
+app.get('/trades/stats/db', (req, res) => {
+  const days  = parseInt(req.query.days) || 30;
+  const since = Date.now() - days * 24 * 60 * 60 * 1000;
+  const recent = tradeHistory.filter(t => new Date(t.exitDate || t.date).getTime() >= since);
+  const wins   = recent.filter(t => t.pnl > 0);
+  const losses = recent.filter(t => t.pnl <= 0);
+  const grossW = wins.reduce((s,t) => s+t.pnl, 0);
+  const grossL = Math.abs(losses.reduce((s,t) => s+t.pnl, 0));
+  res.json({
+    days, n: recent.length, wins: wins.length, losses: losses.length,
+    wr:    recent.length ? (wins.length/recent.length*100).toFixed(1) : 0,
+    pf:    grossL > 0 ? (grossW/grossL).toFixed(2) : null,
+    pnl:   recent.reduce((s,t) => s+t.pnl, 0).toFixed(2),
+    grossW: grossW.toFixed(2), grossL: grossL.toFixed(2),
   });
-  const data = await r.json();
-  const text = data.content?.[0]?.text||'{}';
-  try { return JSON.parse(text.replace(/```json|```/g,'').trim()); }
-  catch(e) { return { regime:'UNKNOWN', prob_crash_30d:0, resumen:'Error parsing IA', error:text.slice(0,200) }; }
-}
-
-async function runMacroAnalysis() {
-  try {
-    const ind      = await fetchMacroIndicators();
-    const analysis = await analyzeWithClaude(ind);
-    if (!analysis) return null;
-    const result   = { ...analysis, indicators:ind, cached:false, updated_at:new Date().toISOString() };
-    const prob     = analysis.prob_crash_30d||0;
-    const regime   = prob>=70?'ALERTA':prob>=40?'VIGILANCIA':'BULL';
-    MACRO_CACHE    = { ts:Date.now(), data:result, prob, regime, last_tg:MACRO_CACHE.last_tg };
-
-    // Telegram si prob > 70% y no enviamos en últimas 6h
-    if (prob>=70 && (Date.now()-MACRO_CACHE.last_tg)>6*3600000) {
-      MACRO_CACHE.last_tg = Date.now();
-      const icon = prob>=85?'🚨':'⚠️';
-      await sendTelegram(`${icon} <b>ALERTA MACRO — ${analysis.regime}</b>\n\n📊 Prob crash 30d: <b>${prob}%</b>\n🔴 Tipo: ${analysis.crash_type_potencial||'N/A'}\n📝 ${analysis.resumen||''}\n⚡ JT: <b>${analysis.recomendacion_jt||''}</b>`);
-    }
-    return result;
-  } catch(e) { console.error('[MACRO]', e.message); return null; }
-}
-
-// Scheduler automático
-function scheduleMacro() {
-  const prob = MACRO_CACHE.prob||0;
-  const ttl  = prob>=70?MACRO_TTL.ALERTA:prob>=40?MACRO_TTL.VIGILANCIA:MACRO_TTL.BULL;
-  setTimeout(async () => {
-    console.log('[MACRO] Análisis automático...');
-    await runMacroAnalysis();
-    scheduleMacro();
-  }, ttl);
-}
-
-app.get('/analisis-macro', async (req, res) => {
-  const force = req.query.force==='true';
-  const now   = Date.now();
-  const ttl   = MACRO_TTL[MACRO_CACHE.regime]||MACRO_TTL.BULL;
-  if (!force && MACRO_CACHE.data && (now-MACRO_CACHE.ts)<ttl) {
-    return res.json({ ...MACRO_CACHE.data, cached:true, cache_age_min:Math.round((now-MACRO_CACHE.ts)/60000) });
-  }
-  const result = await runMacroAnalysis();
-  if (!result) return res.status(500).json({ error:'Error en análisis macro' });
-  const prob = result.prob_crash_30d||0;
-  res.json({ ...result, modo_revision:prob>=70?'6H':prob>=40?'DIARIA':'SEMANAL' });
 });
 
-app.post('/analisis-macro/scan', async (req, res) => {
-  MACRO_CACHE.ts = 0; // forzar refresh
-  const result = await runMacroAnalysis();
-  if (!result) return res.status(500).json({ error:'Error en análisis macro' });
-  res.json(result);
+// ── TRADES — DECISIONS ───────────────────────────────────
+app.get('/trades/decisions', (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  res.json(tradeHistory.slice(0, limit).map(t => ({ ...t, decisions: t.reason || '' })));
+});
+
+// ── NOTICIAS ─────────────────────────────────────────────
+app.get('/alpaca/news', async (req, res) => {
+  try {
+    const { syms, limit = 10 } = req.query;
+    if (!syms) return res.json([]);
+    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=${limit}`, { headers: alpacaHdr() });
+    const d = await r.json();
+    res.json(d.news || d || []);
+  } catch(e) { res.json([]); }
+});
+app.get('/news/headlines', async (req, res) => {
+  try {
+    const { syms } = req.query;
+    if (!syms) return res.json([]);
+    const r = await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=${syms}&limit=20`, { headers: alpacaHdr() });
+    const d = await r.json();
+    res.json(d.news || d || []);
+  } catch(e) { res.json([]); }
+});
+
+// ── SCANNER MOM ──────────────────────────────────────────
+app.get('/scan/mom', (req, res) => {
+  const limit = parseInt(req.query.limit) || 30;
+  res.json(UNIVERSE.slice(0, limit).filter(sym => !openPositions[sym])
+    .map(sym => ({ sym, inUniverse: true, open: false })));
+});
+
+// ── ALPACA — CUENTA ACTIVA / SWITCH ──────────────────────
+app.get('/alpaca/active', (req, res) => res.json({
+  account: ACTIVE_ACCOUNT, label: getAcc().label,
+  base: alpacaBase(), isLive: isLive(),
+}));
+app.post('/alpaca/switch', (req, res) => {
+  const { account } = req.body;
+  if (!account || !ALPACA_ACCOUNTS[account])
+    return res.status(400).json({ error: 'Invalid account. Use: paper2 or live' });
+  ACTIVE_ACCOUNT = account;
+  console.log(`[ACCOUNT] Cambiado a: ${getAcc().label}`);
+  res.json({ ok: true, account: ACTIVE_ACCOUNT, label: getAcc().label });
+});
+
+// ── ALPACA — ÓRDENES MANUALES ────────────────────────────
+app.post('/alpaca/order', async (req, res) => {
+  try {
+    const { sym, qty, side, type = 'market', tif = 'day' } = req.body;
+    if (!sym || !qty || !side) return res.status(400).json({ error: 'sym, qty, side required' });
+    const r = await fetch(`${alpacaBase()}/v2/orders`, {
+      method: 'POST', headers: alpacaHdr(),
+      body: JSON.stringify({ symbol: sym, qty: String(qty), side, type, time_in_force: tif }),
+    });
+    const d = await r.json();
+    if (d.id) {
+      console.log(`[ORDER] ${side} ${qty} ${sym} → ${d.id}`);
+      await sendTelegram(`📋 <b>Orden manual</b>\n${side.toUpperCase()} ${qty} ${sym}\nID: ${d.id}`);
+    }
+    res.json(d);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── TELEGRAM — enviar mensaje manual ────────────────────
+app.post('/telegram', async (req, res) => {
+  try {
+    const msg = req.body.text || req.body.message || '';
+    if (!msg) return res.status(400).json({ error: 'text required' });
+    await sendTelegram(msg);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── IBKR — stubs ─────────────────────────────────────────
+app.get('/ibkr/status',    (req, res) => res.json({ connected: false, message: 'IBKR no conectado en V3' }));
+app.get('/ibkr/positions', (req, res) => res.json([]));
+
+// ═══════════════════════════════════════════════════════
+// ANÁLISIS IA — Capitol Trades + Noticias + Claude
+// v3.6.0: endpoint unificado /analisis-ticker/:sym
+// Combina señal CT (Quiver Quantitative) + noticias
+// (Alpaca News) + análisis Claude en una sola llamada.
+// Variables de entorno opcionales:
+//   QUIVER_API_KEY — Quiver Quantitative (gratuita)
+// Sin keys: el análisis Claude funciona igual pero sin CT
+// ═══════════════════════════════════════════════════════
+
+async function fetchCapitolTradesQuiver(ticker) {
+  const key = process.env.QUIVER_API_KEY || '';
+  if (!key) return { signal: 'NO_KEY', summary: 'QUIVER_API_KEY no configurada', trades: [] };
+  try {
+    const r = await fetch(
+      `https://api.quiverquant.com/beta/historical/congresstrading/${ticker}`,
+      { headers: { 'Accept': 'application/json', 'Authorization': `Token ${key}` } }
+    );
+    if (!r.ok) return { signal: 'NO_DATA', summary: `Quiver HTTP ${r.status}`, trades: [] };
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0)
+      return { signal: 'NEUTRAL', summary: 'Sin trades de congresistas registrados', trades: [] };
+
+    // Solo últimos 90 días con fecha de REPORTE (no transacción)
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 90);
+    const recent = data.filter(t => {
+      const d = new Date(t.ReportDate || t.Date || '');
+      return d >= cutoff;
+    });
+    if (recent.length === 0)
+      return { signal: 'NEUTRAL', summary: 'Sin trades reportados en últimos 90 días', trades: [] };
+
+    let compras = 0, ventas = 0;
+    const compradores = new Set(), vendedores = new Set();
+    const detalles = [];
+    recent.forEach(t => {
+      const tipo = (t.Transaction || '').toLowerCase();
+      const amt  = parseFloat(t.Amount || '15000') || 15000;
+      const pol  = t.Representative || t.Senator || 'Desconocido';
+      const fecha = (t.ReportDate || t.Date || '').slice(0, 10);
+      if (tipo.includes('purchase') || tipo.includes('buy')) {
+        compras += amt; compradores.add(pol);
+        detalles.push(`COMPRA: ${pol} ~$${amt.toLocaleString()} (reportado ${fecha})`);
+      } else if (tipo.includes('sale') || tipo.includes('sell')) {
+        ventas += amt; vendedores.add(pol);
+        detalles.push(`VENTA: ${pol} ~$${amt.toLocaleString()} (reportado ${fecha})`);
+      }
+    });
+
+    const neto = compras - ventas;
+    let signal, summary;
+    if      (neto > 50000 && compradores.size >= 2) { signal = 'BULLISH';      summary = `${compradores.size} congresistas compraron neto $${neto.toLocaleString()} (90d)`; }
+    else if (neto > 20000 && compradores.size >= 1) { signal = 'BULLISH_WEAK'; summary = `${compradores.size} congresista(s) compraron neto $${neto.toLocaleString()} (90d)`; }
+    else if (neto < -50000 && vendedores.size >= 2) { signal = 'BEARISH';      summary = `${vendedores.size} congresistas vendieron neto $${Math.abs(neto).toLocaleString()} (90d)`; }
+    else                                             { signal = 'NEUTRAL';      summary = `Actividad mixta: +$${compras.toLocaleString()} / -$${ventas.toLocaleString()}`; }
+
+    return { signal, summary, trades: detalles.slice(0, 5), n_comp: compradores.size, n_vend: vendedores.size };
+  } catch(e) {
+    return { signal: 'ERROR', summary: `Error CT: ${e.message}`, trades: [] };
+  }
+}
+
+async function fetchNoticiasAlpaca(ticker) {
+  try {
+    const r = await fetch(
+      `${ALPACA_DATA}/v1beta1/news?symbols=${ticker}&limit=5&sort=desc`,
+      { headers: alpacaHdr() }
+    );
+    const d = await r.json();
+    const news = (d.news || d || []).slice(0, 5);
+    if (!news.length) return { headlines: [], summary: 'Sin noticias recientes en Alpaca' };
+    const headlines = news.map(n => ({
+      title:   n.headline || n.title || '',
+      summary: (n.summary || '').slice(0, 120),
+      date:    (n.created_at || n.updated_at || '').slice(0, 10),
+      source:  n.source || '',
+    }));
+    return { headlines, summary: `${headlines.length} noticias recientes` };
+  } catch(e) {
+    return { headlines: [], summary: `Error noticias: ${e.message}` };
+  }
+}
+
+// GET /analisis-ticker/:sym?momentum=481&precio=124&sector=Tech&regimen=BULL
+app.get('/analisis-ticker/:sym', async (req, res) => {
+  const sym = (req.params.sym || '').toUpperCase();
+  if (!sym) return res.status(400).json({ error: 'sym required' });
+
+  const { momentum, precio, sector, regimen, empresa } = req.query;
+
+  try {
+    // Paralelizar CT + noticias
+    const [ct, noticias] = await Promise.all([
+      fetchCapitolTradesQuiver(sym),
+      fetchNoticiasAlpaca(sym),
+    ]);
+
+    // Construir prompt para Claude
+    const ctSection = ct.signal !== 'NO_KEY'
+      ? `\nCAPITOL TRADES (últimos 90 días — fecha de reporte, sin look-ahead):\n  Señal: ${ct.signal}\n  ${ct.summary}\n${ct.trades.map(t=>'  '+t).join('\n')}`
+      : '\nCAPITOL TRADES: No disponible (configurar QUIVER_API_KEY)';
+
+    const newsSection = noticias.headlines.length
+      ? `\nNOTICIAS RECIENTES (Alpaca News):\n${noticias.headlines.map(h=>`  • [${h.date}] ${h.title} (${h.source})`).join('\n')}`
+      : '\nNOTICIAS: Sin noticias recientes';
+
+    const prompt = `Eres un analista cuantitativo experto en momentum investing (estrategia Jegadeesh-Titman 12-1).
+
+TICKER: ${sym}${empresa ? ` (${empresa})` : ''}
+MOMENTUM 12-1: ${momentum || 'N/A'}%
+PRECIO: $${precio || 'N/A'}
+SECTOR: ${sector || 'N/A'}
+RÉGIMEN MERCADO: ${regimen || 'BULL'}
+${ctSection}
+${newsSection}
+
+TAREA: Analiza si ${sym} es candidato sólido para el módulo de momentum mensual.
+El sistema selecciona los 10 tickers con mejor momentum 12-1 y los mantiene 1 mes.
+
+Evalúa brevemente:
+1. 📈 MOMENTUM: ¿Sostenible o pico especulativo?
+2. 🏛️ CAPITOL TRADES: ¿Confirma o contradice la tesis?
+3. 📰 NOTICIAS: ¿Catalizadores reales o ruido?
+4. ⚠️ RIESGOS: Top 2 riesgos para los próximos 30 días
+5. ✅ VEREDICTO: COMPRAR / VIGILAR / EVITAR (una palabra) + razón en una línea
+
+Responde en español. Máximo 180 palabras. Sé directo y concreto.`;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada' });
+
+    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const claudeData = await claudeRes.json();
+    const analisis = claudeData.content?.[0]?.text || 'Sin respuesta de Claude';
+
+    res.json({
+      sym,
+      momentum:       momentum || null,
+      precio:         precio   || null,
+      sector:         sector   || null,
+      capitol_trades: ct,
+      noticias:       noticias.headlines,
+      analisis_ia:    analisis,
+      timestamp:      new Date().toISOString(),
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── DEBUG — verificar variables de entorno ───────────────
+app.get('/debug/env', (req, res) => {
+  const acc = getAcc();
+  res.json({
+    version: '3.6.0',
+    active_account: ACTIVE_ACCOUNT,
+    key_defined:    !!acc.key,
+    key_prefix:     (acc.key||'').slice(0,6),
+    secret_defined: !!acc.secret,
+    base:           acc.base,
+    env_keys: {
+      ALPACA_KEY_2:      !!(process.env.ALPACA_KEY_2),
+      ALPACA_SECRET_2:   !!(process.env.ALPACA_SECRET_2),
+      ALPACA_BASE_2:     process.env.ALPACA_BASE_2 || 'NOT SET',
+      ALPACA_PAPER_KEY:  !!(process.env.ALPACA_PAPER_KEY),
+      ALPACA_PAPER_SECRET: !!(process.env.ALPACA_PAPER_SECRET),
+      ALPACA_PAPER_URL:  process.env.ALPACA_PAPER_URL || 'NOT SET',
+      ALPACA_KEY_ID:     !!(process.env.ALPACA_KEY_ID),
+      ALPACA_SECRETS:    !!(process.env.ALPACA_SECRETS),
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════
 // ARRANQUE
 // ═══════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════
+// ANÁLISIS MACRO — Alerta temprana con IA v3.6.0
+// ═══════════════════════════════════════════════════════
+let MACRO_CACHE = { ts:0, data:null, prob:0, regime:"BULL", last_tg:0 };
+const MACRO_TTL = { BULL:7*24*3600000, VIGILANCIA:24*3600000, ALERTA:6*3600000 };
+
+async function fetchMacroIndicators() {
+  const ind = {};
+  try {
+    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=iex&sort=asc`,{headers:alpacaHdr()});
+    const d = await r.json();
+    const bars=(d.bars||[]).map(b=>b.c);
+    if(bars.length>=200){
+      const last=bars[bars.length-1];
+      const sma50=bars.slice(-50).reduce((a,b)=>a+b,0)/50;
+      const sma200=bars.slice(-200).reduce((a,b)=>a+b,0)/200;
+      const max52=Math.max(...bars.slice(-252));
+      ind.spy={price:last.toFixed(2),sma50:sma50.toFixed(2),sma200:sma200.toFixed(2),
+        above_sma50:last>sma50,above_sma200:last>sma200,
+        drawdown_52w:((last-max52)/max52*100).toFixed(1),
+        mom_20d:((last-bars[bars.length-21])/bars[bars.length-21]*100).toFixed(1),
+        regime:last>sma200?(last>sma50?"BULL":"LATERAL"):"BEAR"};
+    }
+  }catch(e){ind.spy_error=e.message;}
+  try{
+    const r=await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=iex&sort=asc`,{headers:alpacaHdr()});
+    const d=await r.json();const bars=d.bars||[];
+    if(bars.length>=5){const last=bars[bars.length-1].c;const prev=bars[bars.length-6]?.c||last;
+      ind.vix={level:last.toFixed(2),chg_5d:((last-prev)/prev*100).toFixed(1),elevated:last>20,spike:((last-prev)/prev*100)>20};}
+  }catch(e){}
+  try{
+    const [r1,r2]=await Promise.all([
+      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
+      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
+    ]);
+    const [d1,d2]=await Promise.all([r1.json(),r2.json()]);
+    const tlt=(d1.bars||[]).slice(-1)[0]?.c;const shy=(d2.bars||[]).slice(-1)[0]?.c;
+    if(tlt&&shy)ind.yield_curve={tlt_shy_ratio:(tlt/shy).toFixed(3),inverted:(tlt/shy)<1.1};
+  }catch(e){}
+  const secs={QQQ:"Tech/Growth",XLV:"Health",XLE:"Energy",XLF:"Finance",XLU:"Utilities",GLD:"Gold"};
+  ind.sectores={};
+  await Promise.all(Object.entries(secs).map(async([sym,label])=>{
+    try{
+      const r=await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=iex&sort=asc`,{headers:alpacaHdr()});
+      const d=await r.json();const bars=(d.bars||[]).map(b=>b.c);
+      if(bars.length>=20){const last=bars[bars.length-1];
+        ind.sectores[sym]={label,price:last.toFixed(2),mom_20d:((last-bars[0])/bars[0]*100).toFixed(1),mom_5d:((last-bars[bars.length-6])/bars[bars.length-6]*100).toFixed(1)};}
+    }catch(e){}
+  }));
+  try{
+    const r=await fetch(`${ALPACA_DATA}/v1beta1/news?symbols=SPY,QQQ,TLT&limit=6&sort=desc`,{headers:alpacaHdr()});
+    const d=await r.json();
+    ind.noticias=(d.news||d||[]).slice(0,5).map(n=>({title:n.headline||n.title||"",date:(n.created_at||"").slice(0,10)}));
+  }catch(e){ind.noticias=[];}
+  ind.timestamp=new Date().toISOString();
+  return ind;
+}
+
+async function analyzeWithClaude_macro(ind){
+  const apiKey=process.env.ANTHROPIC_API_KEY;if(!apiKey)return null;
+  const spy=ind.spy||{};const vix=ind.vix||{};const yc=ind.yield_curve||{};
+  const secs=ind.sectores||{};const news=ind.noticias||[];
+  const secStr=Object.entries(secs).map(([s,d])=>`${s}:20d=${d.mom_20d}% 5d=${d.mom_5d}%`).join(" | ");
+  const newsStr=news.slice(0,4).map(n=>`• ${n.title} [${n.date}]`).join("\n");
+  const prompt=`Eres analista macro cuantitativo experto en crashes de mercado.\n\nINDICADORES ACTUALES:\nSPY $${spy.price} | SMA50 $${spy.sma50} | SMA200 $${spy.sma200} | Régimen: ${spy.regime} | DD52w: ${spy.drawdown_52w}% | Mom20d: ${spy.mom_20d}%\nVIX proxy (VIXY): $${vix.level} | Cambio 5d: ${vix.chg_5d}%\nYield curve TLT/SHY: ${yc.tlt_shy_ratio} | Invertida: ${yc.inverted}\nSectores 20d: ${secStr}\nNoticias: ${newsStr}\n\nResponde SOLO JSON:\n{"regime":"BULL|LATERAL|BEAR|ALERTA|PRE-CRASH","prob_crash_30d":0-100,"crash_type_potencial":"A_REPRICING|B_LIQUIDEZ|C_POLITICO|NINGUNO","señales_positivas":["max 3"],"señales_negativas":["max 3"],"indicadores_clave":{"spy_regime":"BULL/LATERAL/BEAR","vix_status":"NORMAL/ELEVADO/SPIKE","yield_curve":"NORMAL/PLANA/INVERTIDA","rotacion_sectorial":"RISK-ON/NEUTRAL/RISK-OFF","momentum_macro":"POSITIVO/NEUTRO/NEGATIVO"},"comparativa_historica":"C1_2022|C3_2024|C4_2025|SIN_PARALELISMO","resumen":"2-3 frases en español","recomendacion_jt":"OPERAR_NORMAL|MODO_ALERTA|REDUCIR_EXPOSICION|SALIR_CASH","proxima_revision":"SEMANAL|DIARIA|6H"}`;
+  const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",
+    headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01"},
+    body:JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:800,messages:[{role:"user",content:prompt}]})});
+  const data=await r.json();const text=data.content?.[0]?.text||"{}";
+  try{return JSON.parse(text.replace(/```json|```/g,"").trim());}
+  catch(e){return{regime:"UNKNOWN",prob_crash_30d:0,resumen:"Error parsing IA"};}
+}
+
+async function runMacroAnalysis(){
+  try{
+    const ind=await fetchMacroIndicators();
+    const analysis=await analyzeWithClaude_macro(ind);
+    if(!analysis)return null;
+    const result={...analysis,indicators:ind,cached:false,updated_at:new Date().toISOString()};
+    const prob=analysis.prob_crash_30d||0;
+    const regime=prob>=70?"ALERTA":prob>=40?"VIGILANCIA":"BULL";
+    MACRO_CACHE={ts:Date.now(),data:result,prob,regime,last_tg:MACRO_CACHE.last_tg};
+    if(prob>=70&&(Date.now()-MACRO_CACHE.last_tg)>6*3600000){
+      MACRO_CACHE.last_tg=Date.now();
+      await sendTelegram(`${prob>=85?"🚨":"⚠️"} <b>ALERTA MACRO — ${analysis.regime}</b>\n\n📊 Prob crash 30d: <b>${prob}%</b>\n📝 ${analysis.resumen||""}\n⚡ JT: <b>${analysis.recomendacion_jt||""}</b>`);
+    }
+    return result;
+  }catch(e){console.error("[MACRO]",e.message);return null;}
+}
+
+function scheduleMacro(){
+  const prob=MACRO_CACHE.prob||0;
+  const ttl=prob>=70?MACRO_TTL.ALERTA:prob>=40?MACRO_TTL.VIGILANCIA:MACRO_TTL.BULL;
+  setTimeout(async()=>{ await runMacroAnalysis(); scheduleMacro(); },ttl);
+}
+
+app.get("/analisis-macro",async(req,res)=>{
+  const force=req.query.force==="true";
+  const now=Date.now();
+  const ttl=MACRO_TTL[MACRO_CACHE.regime]||MACRO_TTL.BULL;
+  if(!force&&MACRO_CACHE.data&&(now-MACRO_CACHE.ts)<ttl)
+    return res.json({...MACRO_CACHE.data,cached:true,cache_age_min:Math.round((now-MACRO_CACHE.ts)/60000)});
+  const result=await runMacroAnalysis();
+  if(!result)return res.status(500).json({error:"Error análisis macro"});
+  res.json({...result,modo_revision:(result.prob_crash_30d||0)>=70?"6H":(result.prob_crash_30d||0)>=40?"DIARIA":"SEMANAL"});
+});
+
+app.post("/analisis-macro/scan",async(req,res)=>{
+  MACRO_CACHE.ts=0;
+  const result=await runMacroAnalysis();
+  if(!result)return res.status(500).json({error:"Error análisis macro"});
+  res.json(result);
+});
+
+
 app.listen(PORT, async () => {
-  console.log(`ORS V3.4.0 — puerto ${PORT}`);
-  // Arrancar scheduler análisis macro (primer análisis en 15s)
-  setTimeout(() => { runMacroAnalysis().then(()=>scheduleMacro()); }, 15000);
+  console.log(`ORS V3.6.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
-  console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring)`);
+  console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring) + /analisis-ticker (CT+News+IA)`);
   await sendTelegram(
-    `🚀 <b>ORS V3.4.0 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.6.0 arrancado</b>\n\n` +
     `BULL:    MOM (5) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
-    `<b>Mejoras v3.4.0:</b>\n` +
+    `<b>Nuevo v3.6.0:</b>\n` +
+    `✅ /analisis-ticker — CT + Noticias + IA\n` +
     `✅ I10: Stop bajo VPOC\n` +
     `✅ D03: Bloquear si SPY<-1%\n` +
-    `✅ N02: Wyckoff Spring\n` +
-    `📊 OOS: PF 3.59 MAR 10.58 DD 6.08%\n\n` +
+    `✅ N02: Wyckoff Spring\n\n` +
     `Cuenta: ${getAcc().label}\n` +
     `Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
     `Auto: ${AUTO_EXECUTE}`
   );
   setTimeout(updateRegime, 3000);
+  loadState(); // F8: restaurar estado antes del sync
   setTimeout(async () => {
     try {
-      const r = await fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() });
-      const positions = await r.json();
+      const [posRes, ordRes] = await Promise.all([
+        fetch(`${alpacaBase()}/v2/positions`, { headers:alpacaHdr() }).then(r=>r.json()),
+        fetch(`${alpacaBase()}/v2/orders?status=open&limit=200`, { headers:alpacaHdr() }).then(r=>r.json()).catch(()=>[]),
+      ]);
+      const positions = posRes;
+      const stopBySym = {};
+      (Array.isArray(ordRes) ? ordRes : []).forEach(o => {
+        if (o.type === 'stop' || o.type === 'stop_limit') stopBySym[o.symbol] = o;
+      });
       if (Array.isArray(positions) && positions.length) {
         const synced = [];
         positions.forEach(p => {
@@ -1627,32 +2170,41 @@ app.listen(PORT, async () => {
             const ep   = parseFloat(p.avg_entry_price);
             const side = p.side;
             const system = side === 'short' ? 'SHORT' : 'MOM';
-            const stop = side === 'short'
+            // F9: usar el stop GTC REAL que sigue vivo en el broker.
+            // Solo si no existe, fallback ±3% con aviso explícito.
+            const realStop = stopBySym[p.symbol]
+              ? parseFloat(stopBySym[p.symbol].stop_price) : null;
+            const stop = realStop !== null ? realStop : (side === 'short'
               ? parseFloat((ep*1.03).toFixed(2))
-              : parseFloat((ep*0.97).toFixed(2));
+              : parseFloat((ep*0.97).toFixed(2)));
             openPositions[p.symbol] = {
               sym:p.symbol, qty:Math.abs(parseInt(p.qty)), entry:ep, stop,
               entryDate: new Date().toISOString().slice(0,10),
               maxPrice:ep, minPrice:ep, be:false, runner:false,
               system, ts:Date.now(), synced:true,
             };
-            synced.push(p.symbol);
+            synced.push(p.symbol + (realStop !== null ? '' : '(stop inventado ±3% ⚠️)'));
           }
         });
         if (synced.length) {
           console.log(`[SYNC] ${synced.length} posiciones: ${synced.join(', ')}`);
           await sendTelegram(`📊 <b>Posiciones al arrancar:</b> ${synced.join(', ')}`);
         }
+        saveState();
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
   setInterval(checkMOMSignals,   5*60*1000);
   setInterval(checkShortSignals, 5*60*1000);
   setInterval(managePositions,   3*60*1000);
+  setInterval(reconcilePositions, 5*60*1000); // F6
+  setInterval(saveState,          5*60*1000); // F8
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
+  setTimeout(()=>{ runMacroAnalysis().then(()=>scheduleMacro()); }, 20000);
   setTimeout(checkMOMSignals,    30*1000);
   setTimeout(checkShortSignals,  35*1000);
+  setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
   function scheduleSector() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
