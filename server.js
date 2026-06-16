@@ -2202,6 +2202,10 @@ app.listen(PORT, async () => {
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
   setTimeout(()=>{ runMacroAnalysis().then(()=>scheduleMacro()); }, 20000);
+  // Calcular régimen inmediatamente al arrancar (no esperar 1 hora)
+  updateRegime().then(() => {
+    console.log('[BOOT] Régimen calculado:', MARKET_REGIME.mode, 'SMA50:', MARKET_REGIME.sma50);
+  }).catch(e => console.error('[BOOT] Error régimen:', e.message));
   setTimeout(checkMOMSignals,    30*1000);
   setTimeout(checkShortSignals,  35*1000);
   setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
