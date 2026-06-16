@@ -113,18 +113,99 @@ const UNIVERSE_BASE = [
 // Universo dinámico — se puede expandir en runtime
 let UNIVERSE = [...new Set(UNIVERSE_BASE)];
 
-// Función para expandir el universo con SP500 desde Alpaca
+// ── UNIVERSO DINÁMICO — SP500 completo desde Alpaca ──
+// Descarga todos los activos de renta variable americana
+// filtra por precio, volumen y liquidez mínima
+// Se ejecuta al arrancar y una vez al día
+let UNIVERSE_LAST_UPDATE = 0;
+
 async function expandUniverse() {
   try {
-    // Obtener activos activos de Alpaca con precio > $15
-    const r = await fetch('https://data.alpaca.markets/v2/stocks/snapshots?feed=iex', {
-      headers: alpacaHdr()
-    });
-    // Fallback: usar lista SP500 ampliada que ya tenemos
-    console.log('[UNIVERSE] Usando universo base de', UNIVERSE.length, 'tickers');
+    // Alpaca Assets API — todos los activos activos de US Equity
+    const r = await fetch(
+      'https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity',
+      { headers: alpacaHdr() }
+    );
+    const assets = await r.json();
+    if (!Array.isArray(assets) || assets.length < 100) {
+      console.log('[UNIVERSE] Assets API vacía, usando base');
+      return;
+    }
+
+    // Filtros básicos: tradeable, no OTC, símbolo limpio
+    const candidates = assets
+      .filter(a =>
+        a.tradable &&
+        a.exchange !== 'OTC' &&
+        a.symbol &&
+        /^[A-Z]{1,5}$/.test(a.symbol) &&  // sin puntos ni números
+        a.status === 'active'
+      )
+      .map(a => a.symbol);
+
+    console.log(`[UNIVERSE] ${candidates.length} candidatos de Alpaca Assets`);
+
+    // Ahora filtrar por precio y volumen usando snapshots
+    // Alpaca permite hasta 1000 símbolos por request
+    const filtered = [];
+    const BATCH = 500;
+
+    for (let i = 0; i < Math.min(candidates.length, 3000); i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
+      try {
+        const rs = await fetch(
+          `${ALPACA_DATA}/v2/stocks/snapshots?symbols=${batch.join(',')}&feed=iex`,
+          { headers: alpacaHdr() }
+        );
+        const snaps = await rs.json();
+
+        for (const [sym, snap] of Object.entries(snaps || {})) {
+          const price  = snap?.latestTrade?.p || snap?.latestQuote?.ap || 0;
+          const volume = snap?.dailyBar?.v || 0;
+          const close  = snap?.dailyBar?.c || 0;
+
+          // Filtros de liquidez:
+          // precio > $5, volumen diario > 500k acciones, precio cierre > $5
+          if (price >= 5 && volume >= 500000 && close >= 5) {
+            filtered.push(sym);
+          }
+        }
+        // Pausa entre batches para no saturar la API
+        if (i + BATCH < candidates.length) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } catch(e) {
+        console.log(`[UNIVERSE] Error batch ${i}: ${e.message}`);
+      }
+    }
+
+    if (filtered.length > 100) {
+      // Combinar con la base curada (siempre incluirla)
+      const combined = [...new Set([...UNIVERSE_BASE, ...filtered])];
+      UNIVERSE = combined;
+      UNIVERSE_LAST_UPDATE = Date.now();
+      console.log(`[UNIVERSE] ✅ Expandido a ${UNIVERSE.length} tickers (${filtered.length} nuevos de Alpaca)`);
+      await sendTelegram(`🌍 Universo actualizado: <b>${UNIVERSE.length} tickers</b>\n${filtered.length} de Alpaca + ${UNIVERSE_BASE.length} curados`);
+    } else {
+      console.log(`[UNIVERSE] Pocos tickers filtrados (${filtered.length}), manteniendo base`);
+    }
   } catch(e) {
-    console.log('[UNIVERSE] Error expandiendo, usando base:', e.message);
+    console.log('[UNIVERSE] Error expandiendo:', e.message, '— usando base de', UNIVERSE.length, 'tickers');
   }
+}
+
+// Actualizar universo una vez al día (a las 21:00 UTC = antes del día siguiente)
+function scheduleUniverseUpdate() {
+  const now   = new Date();
+  const next  = new Date();
+  next.setUTCHours(21, 0, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const msUntil = next - now;
+  setTimeout(async () => {
+    await expandUniverse();
+    scheduleUniverseUpdate(); // reprogramar para mañana
+  }, msUntil);
+  console.log(`[UNIVERSE] Próxima actualización en ${Math.round(msUntil/3600000)}h`);
 }
 const SECTOR_MAP = {
   NVDA:'XLK',AMD:'XLK',AVGO:'XLK',TSM:'XLK',MU:'XLK',
@@ -2143,6 +2224,20 @@ function scheduleMacro(){
   setTimeout(async()=>{ await runMacroAnalysis(); scheduleMacro(); },ttl);
 }
 
+app.get('/universe', (req, res) => {
+  res.json({
+    total:       UNIVERSE.length,
+    base:        UNIVERSE_BASE.length,
+    last_update: UNIVERSE_LAST_UPDATE ? new Date(UNIVERSE_LAST_UPDATE).toISOString() : 'nunca',
+    sample:      UNIVERSE.slice(0, 20),
+  });
+});
+
+app.post('/universe/refresh', async (req, res) => {
+  res.json({ status: 'refreshing', current: UNIVERSE.length });
+  expandUniverse().catch(e => console.error('[UNIVERSE]', e.message));
+});
+
 app.get("/analisis-macro",async(req,res)=>{
   const force=req.query.force==="true";
   const now=Date.now();
@@ -2232,8 +2327,9 @@ app.listen(PORT, async () => {
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
   setTimeout(()=>{ runMacroAnalysis().then(()=>scheduleMacro()); }, 20000);
-  // Expandir universo al arrancar
+  // Expandir universo al arrancar y programar actualización diaria
   expandUniverse().catch(e => console.log('[UNIVERSE] Error:', e.message));
+  scheduleUniverseUpdate();
 
   // Calcular régimen inmediatamente al arrancar (no esperar 1 hora)
   updateRegime().then(() => {
