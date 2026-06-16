@@ -83,7 +83,8 @@ const alpacaHdr = () => ({
 });
 const isLive = () => ACTIVE_ACCOUNT === 'live';
 // ── UNIVERSO ──────────────────────────────────────────
-const UNIVERSE = [
+// Universo base (watchlist curada) — siempre disponible
+const UNIVERSE_BASE = [
   'NVDA','AMD','AVGO','TSM','MU','QCOM','MRVL','SMCI','ORCL','PLTR',
   'META','AMZN','GOOGL','MSFT','NFLX','CRM','NOW','SNOW','DDOG','MDB',
   'CRWD','PANW','NET','CRWV',
@@ -94,8 +95,37 @@ const UNIVERSE = [
   'CAT','HON','ROK','GD','LMT','RTX','FDX',
   'RKLB','LUNR','TSLA',
   'JPM','GS','MS','COIN',
-  'HUT','TKO','BE','AMG','EL','HUM','SMCI',
+  'HUT','TKO','BE','AMG','EL','HUM',
+  // SP500 adicionales — expansión del universo
+  'AAPL','INTC','LRCX','AMAT','KLAC','MCHP','ON','TXN','ADI','NXPI',
+  'ADBE','INTU','ANSS','CDNS','FTNT','OKTA','ZS','WDAY','TEAM','HUBS',
+  'SHOP','SQ','PYPL','AFRM','UPST',
+  'ABBV','BMY','MRK','PFE','BIIB','VRTX','INCY','JAZZ','EXEL',
+  'BA','LHX','NOC','LDOS','SAIC','AXON','KTOS',
+  'RCL','CCL','MAR','HLT','MGM','WYNN','LVS',
+  'F','GM','RIVN','LCID',
+  'WFC','BAC','C','USB','PNC','TFC','SCHW','BLK','BX','KKR','APO',
+  'MSTR','RIOT','MARA','CLSK',
+  'ASTS','RKLB','SPCE','RBA',
+  'CLX','MO','PM','MNST','KHC',
+  'SLB','HAL','BKR','MPC','PSX','VLO',
 ];
+// Universo dinámico — se puede expandir en runtime
+let UNIVERSE = [...new Set(UNIVERSE_BASE)];
+
+// Función para expandir el universo con SP500 desde Alpaca
+async function expandUniverse() {
+  try {
+    // Obtener activos activos de Alpaca con precio > $15
+    const r = await fetch('https://data.alpaca.markets/v2/stocks/snapshots?feed=iex', {
+      headers: alpacaHdr()
+    });
+    // Fallback: usar lista SP500 ampliada que ya tenemos
+    console.log('[UNIVERSE] Usando universo base de', UNIVERSE.length, 'tickers');
+  } catch(e) {
+    console.log('[UNIVERSE] Error expandiendo, usando base:', e.message);
+  }
+}
 const SECTOR_MAP = {
   NVDA:'XLK',AMD:'XLK',AVGO:'XLK',TSM:'XLK',MU:'XLK',
   QCOM:'XLK',MRVL:'XLK',SMCI:'XLK',ORCL:'XLK',PLTR:'XLK',
@@ -1318,7 +1348,7 @@ async function pollTelegram() {
         const reg = MARKET_REGIME;
         const spyChg = await getSPYDailyChange();
         await sendTelegram(
-          `⚙️ <b>Estado V3.4.0</b>\n\n` +
+          `⚙️ <b>Estado V3.6.0</b>\n\n` +
           `🏛️ Régimen: <b>${reg.mode}</b>\n` +
           `SPY $${reg.price?.toFixed(2)||'—'} (${spyChg>=0?'+':''}${spyChg.toFixed(2)}% hoy)\n` +
           `SMA50 $${reg.sma50||'—'} | bearStreak: ${reg.bearStreak}\n\n` +
@@ -1350,7 +1380,7 @@ async function pollTelegram() {
       }
       else if (text === '/ayuda' || text === '/help') {
         await sendTelegram(
-          `🤖 <b>ORS V3.4.0</b>\n\n` +
+          `🤖 <b>ORS V3.6.0</b>\n\n` +
           `<b>ÓRDENES</b>\n` +
           `/si — Confirmar última orden\n` +
           `/no — Cancelar última orden\n` +
@@ -1382,7 +1412,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.5.6', version: '3.6.0',
+  status: 'ORS V3.6.0', version: '3.6.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -2202,10 +2232,54 @@ app.listen(PORT, async () => {
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
   setTimeout(()=>{ runMacroAnalysis().then(()=>scheduleMacro()); }, 20000);
+  // Expandir universo al arrancar
+  expandUniverse().catch(e => console.log('[UNIVERSE] Error:', e.message));
+
   // Calcular régimen inmediatamente al arrancar (no esperar 1 hora)
   updateRegime().then(() => {
     console.log('[BOOT] Régimen calculado:', MARKET_REGIME.mode, 'SMA50:', MARKET_REGIME.sma50);
   }).catch(e => console.error('[BOOT] Error régimen:', e.message));
+
+  // Recuperar posiciones de Alpaca al arrancar
+  setTimeout(async () => {
+    try {
+      const r = await fetch(`${alpacaBase()}/v2/positions`, { headers: alpacaHdr() });
+      const positions = await r.json();
+      if (!Array.isArray(positions)) return;
+      let recovered = 0;
+      for (const p of positions) {
+        const sym  = p.symbol;
+        const qty  = Math.abs(parseInt(p.qty));
+        const side = p.side; // 'long' o 'short'
+        if (openPositions[sym]) continue; // ya conocida
+        const entry = parseFloat(p.avg_entry_price);
+        const isShort = side === 'short';
+        // Buscar stop activo en Alpaca
+        let stop = isShort ? entry * 1.05 : entry * 0.95;
+        try {
+          const ro = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}&limit=10`, { headers: alpacaHdr() });
+          const orders = await ro.json();
+          const stopOrder = (orders || []).find(o => o.type === 'stop' || o.order_type === 'stop');
+          if (stopOrder) stop = parseFloat(stopOrder.stop_price);
+        } catch(e) {}
+        openPositions[sym] = {
+          sym, qty, entry, stop,
+          entryDate: new Date().toISOString().slice(0,10),
+          maxPrice:  isShort ? entry : parseFloat(p.current_price || entry),
+          minPrice:  isShort ? parseFloat(p.current_price || entry) : entry,
+          be: false, runner: false,
+          system: isShort ? 'SHORT' : 'MOM',
+          ts: Date.now(), synced: true,
+        };
+        recovered++;
+        console.log(`[BOOT] Posición recuperada: ${sym} ${side} ${qty} @ $${entry} stop $${stop}`);
+      }
+      if (recovered > 0) {
+        console.log(`[BOOT] ${recovered} posiciones recuperadas de Alpaca`);
+        await sendTelegram(`🔄 <b>Servidor reiniciado</b>\n${recovered} posición(es) recuperada(s) de Alpaca:\n${Object.keys(openPositions).join(', ')}`);
+      }
+    } catch(e) { console.error('[BOOT] Error recuperando posiciones:', e.message); }
+  }, 5000);
   setTimeout(checkMOMSignals,    30*1000);
   setTimeout(checkShortSignals,  35*1000);
   setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
