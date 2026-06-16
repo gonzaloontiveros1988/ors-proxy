@@ -122,8 +122,10 @@ let UNIVERSE_LAST_UPDATE = 0;
 async function expandUniverse() {
   try {
     // Alpaca Assets API — todos los activos activos de US Equity
+    // Assets API — funciona con paper y live por igual
+    const brokerBase = getAcc().base || 'https://paper-api.alpaca.markets';
     const r = await fetch(
-      'https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity',
+      `${brokerBase}/v2/assets?status=active&asset_class=us_equity`,
       { headers: alpacaHdr() }
     );
     const assets = await r.json();
@@ -190,7 +192,9 @@ async function expandUniverse() {
       console.log(`[UNIVERSE] Pocos tickers filtrados (${filtered.length}), manteniendo base`);
     }
   } catch(e) {
-    console.log('[UNIVERSE] Error expandiendo:', e.message, '— usando base de', UNIVERSE.length, 'tickers');
+    console.error('[UNIVERSE] Error expandiendo:', e.message);
+    console.error('[UNIVERSE] Stack:', e.stack?.slice(0,200));
+    console.log('[UNIVERSE] Usando base de', UNIVERSE.length, 'tickers');
   }
 }
 
@@ -1261,6 +1265,28 @@ async function reconcilePositions() {
         const pos = openPositions[sym];
         await sendTelegram(`🚨 <b>RECON: ${sym} SIN STOP en broker</b>\nRecolocando stop $${pos.stop}`);
         await updateAlpacaStop(sym, pos.qty, pos.stop, pos.system === 'SHORT');
+      }
+      // 3b) Stop existe en broker — sincronizar servidor con broker
+      // Si el stop del broker es MEJOR (más alto para long, más bajo para short)
+      // actualizar el servidor para no sobrescribir stops manuales
+      if (posBySym[sym] && stopBySym[sym]) {
+        const pos        = openPositions[sym];
+        const brokerStop = parseFloat(stopBySym[sym].stop_price);
+        const isShort    = pos.system === 'SHORT';
+        const brokerIsBetter = isShort
+          ? brokerStop < pos.stop   // short: stop más bajo = mejor protección
+          : brokerStop > pos.stop;  // long:  stop más alto = mejor protección
+        if (brokerIsBetter && Math.abs(brokerStop - pos.stop) > 0.05) {
+          console.log(`[RECON] ${sym} stop broker $${brokerStop} > servidor $${pos.stop} → adoptando broker`);
+          openPositions[sym].stop = brokerStop;
+          // Si el stop está por encima del entry en long → marcar BE
+          if (!isShort && brokerStop > pos.entry) {
+            openPositions[sym].be = true;
+          }
+          if (isShort && brokerStop < pos.entry) {
+            openPositions[sym].be = true;
+          }
+        }
       }
     }
     // 4) Diferencia de cantidad → alertar (fills parciales, intervención manual)
@@ -2358,14 +2384,38 @@ app.listen(PORT, async () => {
           const stopOrder = (orders || []).find(o => o.type === 'stop' || o.order_type === 'stop');
           if (stopOrder) stop = parseFloat(stopOrder.stop_price);
         } catch(e) {}
+        const currentPx = parseFloat(p.current_price || entry);
+        const gainPct   = entry > 0 ? (currentPx - entry) / entry * 100 : 0;
+        const beThr     = entry > 300 ? 1.5 : entry > 100 ? 2.0 : 3.0;
+
+        // Usar el stop del broker si es mejor que el calculado
+        // (el usuario puede haber subido el stop manualmente)
+        const brokerStop = stop;
+        const calcStop   = isShort
+          ? parseFloat((entry * 0.999).toFixed(2))   // BE short
+          : parseFloat((entry * 1.001).toFixed(2));   // BE long
+        
+        // Si el stop del broker ya está por encima del entry (long) → ya está en BE
+        const beFromBroker = !isShort
+          ? brokerStop > entry   // stop por encima de entrada = BE
+          : brokerStop < entry;  // stop por debajo de entrada = BE short
+
+        const beActive = gainPct >= beThr || beFromBroker;
+
+        // Usar el stop del broker tal cual — no recalcular
+        // Así respetamos stops manuales que el usuario haya puesto
         openPositions[sym] = {
-          sym, qty, entry, stop,
+          sym, qty,
+          entry,
+          stop:      brokerStop,  // respetar stop actual del broker
           entryDate: new Date().toISOString().slice(0,10),
-          maxPrice:  isShort ? entry : parseFloat(p.current_price || entry),
-          minPrice:  isShort ? parseFloat(p.current_price || entry) : entry,
-          be: false, runner: false,
-          system: isShort ? 'SHORT' : 'MOM',
-          ts: Date.now(), synced: true,
+          maxPrice:  isShort ? Math.min(entry, currentPx) : Math.max(entry, currentPx),
+          minPrice:  Math.min(entry, currentPx),
+          be:        beActive,
+          runner:    false,
+          system:    isShort ? 'SHORT' : 'MOM',
+          ts:        Date.now(),
+          synced:    true,
         };
         recovered++;
         console.log(`[BOOT] Posición recuperada: ${sym} ${side} ${qty} @ $${entry} stop $${stop}`);
