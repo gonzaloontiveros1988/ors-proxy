@@ -1,4 +1,4 @@
-// server.js — v3.5.6
+// server.js — v3.6.0 (EXITS-ATR: trailing escalonado)
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -270,19 +270,6 @@ function loadState() {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     if (s.openPositions) Object.assign(openPositions, s.openPositions);
     if (Array.isArray(s.tradeHistory)) tradeHistory = s.tradeHistory;
-    // Cargar desde archivo si el estado está vacío
-    if (tradeHistory.length === 0) {
-      try {
-        const fs = require('fs');
-        if (fs.existsSync('/tmp/trade_history.json')) {
-          const saved = JSON.parse(fs.readFileSync('/tmp/trade_history.json','utf8'));
-          if (Array.isArray(saved) && saved.length > 0) {
-            tradeHistory = saved;
-            console.log(`[STATE] TradeHistory cargado desde archivo: ${tradeHistory.length} trades`);
-          }
-        }
-      } catch(e) {}
-    }
     if (s.monthlyTrades) Object.assign(monthlyTrades, s.monthlyTrades);
     console.log(`[STATE] Restaurado: ${Object.keys(openPositions).length} pos, ${tradeHistory.length} trades (guardado ${s.savedAt})`);
   } catch(e) { console.log('[STATE] load:', e.message); }
@@ -478,7 +465,7 @@ async function fetchBars15min(sym) {
 }
 async function fetchDailyBars(sym, limit = 220) {
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
     if (!text || text.trim().startsWith('<')) return null;
@@ -668,49 +655,60 @@ function calcQty(entry, stop, sizeMult = 1.0) {
 // GESTIÓN POSICIONES — EXITS
 // ═══════════════════════════════════════════════════════
 async function manageLongExit(sym, pos, bar, date, dailyBars) {
+  // v3.6.0 EXITS-ATR: trailing por ATR escalonado. Reemplaza el BE pegado
+  // (que mataba posiciones por ruido) y el trailing por EMA20 diaria (que iba
+  // tan rezagado que devolvía ganancias grandes — el caso HUM: +1800€→BE).
+  // Principio: el stop SOLO sube, nunca baja; la distancia se aprieta según R.
   const price = bar.c, low = bar.l || price;
   if (price > (pos.maxPrice || pos.entry)) pos.maxPrice = price;
-  const gainPct = (price - pos.entry) / pos.entry * 100;
+
+  // 0) Stop tocado → salir (red primaria; el GTC del broker es la red dura)
   if (low <= pos.stop) {
     const ep  = pos.stop * (1 - SLIPPAGE);
     const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
     return { close:true, exitPrice:ep, pnl, reason: pos.runner ? 'RunnerStop' : 'Stop' };
   }
-  if (pos.system === 'BOLL' && pos.target && price >= pos.target * 0.998 && !pos.be) {
-    pos.stop = parseFloat((pos.entry * 1.002).toFixed(2));
-    pos.be   = true;
-    await sendTelegram(`🎯 <b>BOLL Target — ${sym}</b>\nPrecio tocó banda media $${pos.target.toFixed(2)}\nStop → BE $${pos.stop}`);
+
+  // ATR de referencia: el guardado en la entrada (riesgo inicial R), con fallback
+  const atr = pos.atr || Math.abs(pos.entry - pos.entrySenalStop || 0) || (pos.entry * 0.02);
+  const R   = pos.entry - (pos.initialStop || (pos.entry - atr * 1.5)); // riesgo inicial en $
+  const gainR = R > 0 ? (price - pos.entry) / R : 0;  // ganancia en múltiplos de R
+  const maxP  = pos.maxPrice;
+
+  // 1) BOLL target: cerrar al tocar banda media (lógica propia de BOLL)
+  if (pos.system === 'BOLL' && pos.target && price >= pos.target * 0.998) {
+    const ep  = price * (1 - SLIPPAGE);
+    const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
+    return { close:true, exitPrice:ep, pnl, reason:'BollTarget' };
   }
-  // BE dinámico por capitalización
-  const beThr = pos.entry > 300 ? 1.5 : pos.entry > 100 ? 2.0 : 3.0;
-  if (gainPct >= beThr && !pos.be) {
-    pos.stop = parseFloat((pos.entry * 1.001).toFixed(2));
-    pos.be   = true;
-    await updateAlpacaStop(sym, pos.qty, pos.stop, false);
-    console.log(`[BE] ${sym} stop → $${pos.stop}`);
-  }
-  if (pos.be && dailyBars && dailyBars.length >= 20) {
-    const dCloses = dailyBars.map(b => b.c);
-    const ema20   = calcEMA(dCloses, 20);
-    const obvD    = calcOBV(dailyBars);
-    if (ema20 && obvD) {
-      if (price > ema20 && obvD.bullish) {
-        const rs = parseFloat(ema20.toFixed(2));
-        if (rs > pos.stop) {
-          pos.stop = rs; pos.runner = true;
-          await updateAlpacaStop(sym, pos.qty, pos.stop, false);
-          console.log(`[RUNNER] ${sym} stop → $${pos.stop}`);
-        }
-      } else if (pos.runner) {
-        const ep  = price * (1 - SLIPPAGE);
-        const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
-        return { close:true, exitPrice:ep, pnl, reason:'RunnerExit' };
-      }
+
+  // 2) Trailing escalonado por ATR — la distancia se aprieta cuanto más sube.
+  //    Estos múltiplos son el corazón del fix del caso HUM.
+  let trailMult = null;
+  if      (gainR >= 5) trailMult = 1.0;   // +5R o más → muy ceñido (protege ganancia grande)
+  else if (gainR >= 3) trailMult = 1.5;   // +3R → ceñido
+  else if (gainR >= 1) trailMult = 3.0;   // +1R → holgado, deja correr
+  // (por debajo de +1R no se traila: el stop inicial manda; deja respirar)
+
+  if (trailMult !== null && atr > 0) {
+    const trailStop = parseFloat((maxP - atr * trailMult).toFixed(2));
+    // El stop SOLO sube. Y una vez en +1R, nunca por debajo de BE+0.5ATR.
+    const beFloor = parseFloat((pos.entry + atr * 0.5).toFixed(2));
+    const candidate = Math.max(trailStop, gainR >= 1 ? beFloor : pos.stop);
+    if (candidate > pos.stop + 0.01) {
+      pos.stop = candidate;
+      if (!pos.be && pos.stop >= pos.entry) pos.be = true;
+      if (gainR >= 1) pos.runner = true;
+      await updateAlpacaStop(sym, pos.qty, pos.stop, false);
+      console.log(`[TRAIL] ${sym} +${gainR.toFixed(1)}R stop → $${pos.stop} (x${trailMult}ATR bajo max $${maxP.toFixed(2)})`);
     }
   }
-  if (!pos.be) {
+
+  // 3) TimeStop solo si la posición NO ha despegado (sigue por debajo de +1R)
+  //    tras 7 días. Más laxo que antes (5d): da margen a desarrollarse.
+  if (gainR < 1) {
     const days = Math.floor((new Date(date) - new Date(pos.entryDate)) / 86400000);
-    if (days >= 5) {
+    if (days >= 7) {
       const ep  = price * (1 - SLIPPAGE);
       const pnl = (ep - pos.entry) * pos.qty / EUR_USD;
       return { close:true, exitPrice:ep, pnl, reason:'TimeStop' };
@@ -719,42 +717,43 @@ async function manageLongExit(sym, pos, bar, date, dailyBars) {
   return null;
 }
 async function manageShortExit(sym, pos, bar, date, dailyBars) {
+  // v3.6.0 EXITS-ATR: espejo del trailing escalonado para cortos.
+  // El stop SOLO baja (mejora), nunca sube; se aprieta según R de ganancia.
   const price = bar.c, high = bar.h || price;
   if (price < (pos.minPrice || pos.entry)) pos.minPrice = price;
-  const gainPct = (pos.entry - price) / pos.entry * 100;
+
   if (high >= pos.stop) {
     const ep  = pos.stop * (1 + SLIPPAGE);
     const pnl = (pos.entry - ep) * pos.qty / EUR_USD;
     return { close:true, exitPrice:ep, pnl, reason: pos.runner ? 'RunnerStop' : 'Stop' };
   }
-  if (gainPct >= 3.0 && !pos.be) {
-    pos.stop = parseFloat((pos.entry * 0.999).toFixed(2));
-    pos.be   = true;
-    await updateAlpacaStop(sym, pos.qty, pos.stop, true);
-    console.log(`[BE] SHORT ${sym} stop → $${pos.stop}`);
-  }
-  if (pos.be && dailyBars && dailyBars.length >= 20) {
-    const dCloses = dailyBars.map(b => b.c);
-    const ema20   = calcEMA(dCloses, 20);
-    const obvD    = calcOBV(dailyBars);
-    if (ema20 && obvD) {
-      if (price < ema20 && obvD.bearish) {
-        const rs = parseFloat(ema20.toFixed(2));
-        if (rs < pos.stop) {
-          pos.stop = rs; pos.runner = true;
-          await updateAlpacaStop(sym, pos.qty, pos.stop, true);
-          console.log(`[RUNNER] SHORT ${sym} stop → $${pos.stop}`);
-        }
-      } else if (pos.runner) {
-        const ep  = price * (1 + SLIPPAGE);
-        const pnl = (pos.entry - ep) * pos.qty / EUR_USD;
-        return { close:true, exitPrice:ep, pnl, reason:'RunnerExit' };
-      }
+
+  const atr   = pos.atr || (pos.entry * 0.02);
+  const R     = (pos.initialStop || (pos.entry + atr * 1.5)) - pos.entry; // riesgo inicial $
+  const gainR = R > 0 ? (pos.entry - price) / R : 0;
+  const minP  = pos.minPrice;
+
+  let trailMult = null;
+  if      (gainR >= 5) trailMult = 1.0;
+  else if (gainR >= 3) trailMult = 1.5;
+  else if (gainR >= 1) trailMult = 3.0;
+
+  if (trailMult !== null && atr > 0) {
+    const trailStop = parseFloat((minP + atr * trailMult).toFixed(2));
+    const beFloor   = parseFloat((pos.entry - atr * 0.5).toFixed(2));
+    const candidate = Math.min(trailStop, gainR >= 1 ? beFloor : pos.stop);
+    if (candidate < pos.stop - 0.01) {
+      pos.stop = candidate;
+      if (!pos.be && pos.stop <= pos.entry) pos.be = true;
+      if (gainR >= 1) pos.runner = true;
+      await updateAlpacaStop(sym, pos.qty, pos.stop, true);
+      console.log(`[TRAIL] SHORT ${sym} +${gainR.toFixed(1)}R stop → $${pos.stop}`);
     }
   }
-  if (!pos.be) {
+
+  if (gainR < 1) {
     const days = Math.floor((new Date(date) - new Date(pos.entryDate)) / 86400000);
-    if (days >= 5) {
+    if (days >= 7) {
       const ep  = price * (1 + SLIPPAGE);
       const pnl = (pos.entry - ep) * pos.qty / EUR_USD;
       return { close:true, exitPrice:ep, pnl, reason:'TimeStop' };
@@ -847,6 +846,9 @@ async function executeBuy(sym, entry, stop, qty, meta = {}) {
       be:false, runner:false, system: meta.system || 'MOM',
       target: meta.target || null, ts: Date.now(),
       orderId: o.id, entrySenal: entry,
+      // v3.6.0 EXITS-ATR: guardar ATR y stop inicial para el trailing escalonado
+      atr: meta.atr || Math.abs(entryReal - stop) / 1.5,
+      initialStop: stop,
     };
     saveState();
     const mode = isLive() ? '🔴 REAL' : '📋 PAPER';
@@ -1074,7 +1076,7 @@ async function checkMOMSignals() {
     sentAlerts[key] = Date.now();
 
     if (AUTO_EXECUTE) {
-      await executeBuy(sym, entry, stop, qty, { system: sig.type, target });
+      await executeBuy(sym, entry, stop, qty, { system: sig.type, target, atr: atrVal });
       monthlyTrades[`${sym}_${month}`] = true;
       if (sig.type === 'MOM' && Object.values(openPositions).filter(p=>p.system==='MOM').length >= MAX_MOM) break;
       if (sig.type === 'BOLL' && Object.values(openPositions).filter(p=>p.system==='BOLL').length >= MAX_BOLL) break;
@@ -1162,7 +1164,8 @@ async function checkShortSignals() {
           openPositions[sym] = { sym, qty, entry: entryReal, stop,
             entryDate: new Date().toISOString().slice(0,10),
             minPrice:entryReal, be:false, runner:false, system:'SHORT',
-            ts:Date.now(), orderId:o.id, entrySenal:entry };
+            ts:Date.now(), orderId:o.id, entrySenal:entry,
+            atr: atrVal, initialStop: stop };
           monthlyTrades[`${sym}_short_${month}`] = true;
           saveState();
           const riskEur = Math.round((stop - entryReal) * qty / EUR_USD);
@@ -1201,7 +1204,24 @@ async function managePositions() {
       const price = snap.price;
       const date  = new Date().toISOString().slice(0,10);
       const dailyBars = await fetchDailyBars(sym, 30);
-      const bar = { c: price, h: price * 1.001, l: price * 0.999 };
+      // v3.6.0 EXITS-ATR: si la posición no tiene atr/initialStop (adoptada por
+      // sync o de una versión anterior), derivarlos ahora para que el trailing
+      // escalonado funcione también con posiciones preexistentes.
+      if (!pos.atr) {
+        const b15 = await fetchBars15min(sym).catch(() => null);
+        const a = b15 ? calcATR(b15, 14) : null;
+        pos.atr = a || Math.abs(pos.entry - pos.stop) / 1.5 || pos.entry * 0.02;
+      }
+      if (!pos.initialStop) pos.initialStop = pos.stop;
+      // Usar high/low reales de la última vela 15m (no la vela sintética ±0.1%)
+      let bar = { c: price, h: price, l: price };
+      try {
+        const b15b = await fetchBars15min(sym).catch(() => null);
+        if (b15b && b15b.length) {
+          const lb = b15b[b15b.length - 1];
+          bar = { c: price, h: Math.max(lb.h || price, price), l: Math.min(lb.l || price, price) };
+        }
+      } catch(_) {}
       let result = null;
       if (pos.system === 'SHORT') {
         result = await manageShortExit(sym, pos, bar, date, dailyBars);
@@ -1554,52 +1574,26 @@ app.get('/health', (req, res) => res.json({
 app.get('/regime',        (req, res) => res.json(MARKET_REGIME));
 app.get('/market/regime', (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
-app.get('/trades', async (req, res) => {
+app.get('/trades', (req, res) => {
   const limit = parseInt(req.query.limit) || 200;
-
-  // Obtener precios actuales de posiciones abiertas en un solo batch
-  const openSyms = Object.keys(openPositions);
-  let snapshots = {};
-  if (openSyms.length > 0) {
-    try {
-      const r = await fetch(
-        `${ALPACA_DATA}/v2/stocks/snapshots?symbols=${openSyms.join(',')}&feed=iex`,
-        { headers: alpacaHdr() }
-      );
-      snapshots = await r.json() || {};
-    } catch(e) {}
-  }
-
   // Incluir posiciones abiertas actuales como trades con status='open'
-  const openTrades = Object.entries(openPositions).map(([sym, pos]) => {
-    const snap = snapshots[sym];
-    const currentPx = snap?.latestTrade?.p || snap?.dailyBar?.c || pos.entry;
-    const pnlUsd = pos.system === 'SHORT'
-      ? (pos.entry - currentPx) * pos.qty
-      : (currentPx - pos.entry) * pos.qty;
-    return {
-    id:           `OPEN_${sym}_${pos.entryDate}`,
+  const openTrades = Object.entries(openPositions).map(([sym, pos]) => ({
+    id:           `OPEN_${sym}_${pos.edate}`,
     sym:          sym,
     ticker:       sym,
     system:       pos.system || 'MOM',
     module:       pos.system || 'MOM',
     status:       'open',
-    entry_date:   pos.entryDate,
+    entry_date:   pos.edate,
     entry_price:  pos.entry,
     stop:         pos.stop,
     qty:          pos.qty,
-
+    pnl_eur:      null,
     win:          null,
     reason:       null,
     be_active:    pos.be || false,
     runner:       pos.runner || false,
-    max_price:    pos.maxPrice || pos.entry,
-    current_price: currentPx,
-    pnl_usd:      Math.round(pnlUsd * 100) / 100,
-    pnl_eur:      Math.round(pnlUsd / 1.08),
-    pnl_pct:      pos.entry > 0 ? Math.round((currentPx - pos.entry) / pos.entry * 1000) / 10 : 0,
-  };
-  });
+  }));
   // Trades cerrados del historial
   const closedTrades = tradeHistory.slice(0, limit).map(t => ({
     ...t,
@@ -1617,25 +1611,6 @@ app.get('/trades', async (req, res) => {
   // Devolver array directo (no objeto wrapeado)
   res.json([...openTrades, ...closedTrades]);
 });
-app.get('/trades/history', (req, res) => {
-  const limit = parseInt(req.query.limit) || 200;
-  const closed = tradeHistory.slice(0, limit).map(t => ({
-    ...t,
-    id:          t.id || `${t.sym}_${t.exitDate||t.date}`,
-    ticker:      t.sym,
-    module:      t.system || 'MOM',
-    status:      'closed',
-    entry_date:  t.entryDate || t.date,
-    exit_date:   t.exitDate,
-    entry_price: t.entry,
-    exit_price:  t.exit,
-    pnl_eur:     t.pnlEur || t.pnl || 0,
-    win:         t.win,
-    reason:      t.exitReason || t.reason || '',
-  }));
-  res.json(closed);
-});
-
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
     const wins  = trades.filter(t=>t.win);
@@ -1836,7 +1811,7 @@ app.get('/alpaca/bars/daily', async (req, res) => {
   const { sym, limit = 504 } = req.query;
   if (!sym) return res.status(400).json({ error: 'sym required' });
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const d   = await r.json();
     if (!d.bars) return res.json({ sym, bars: [], count: 0 });
@@ -2221,7 +2196,7 @@ const MACRO_TTL = { BULL:7*24*3600000, VIGILANCIA:24*3600000, ALERTA:6*3600000 }
 async function fetchMacroIndicators() {
   const ind = {};
   try {
-    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=sip&sort=asc`,{headers:alpacaHdr()});
+    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=iex&sort=asc`,{headers:alpacaHdr()});
     const d = await r.json();
     const bars=(d.bars||[]).map(b=>b.c);
     if(bars.length>=200){
@@ -2237,15 +2212,15 @@ async function fetchMacroIndicators() {
     }
   }catch(e){ind.spy_error=e.message;}
   try{
-    const r=await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=sip&sort=asc`,{headers:alpacaHdr()});
+    const r=await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=iex&sort=asc`,{headers:alpacaHdr()});
     const d=await r.json();const bars=d.bars||[];
     if(bars.length>=5){const last=bars[bars.length-1].c;const prev=bars[bars.length-6]?.c||last;
       ind.vix={level:last.toFixed(2),chg_5d:((last-prev)/prev*100).toFixed(1),elevated:last>20,spike:((last-prev)/prev*100)>20};}
   }catch(e){}
   try{
     const [r1,r2]=await Promise.all([
-      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`,{headers:alpacaHdr()}),
-      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`,{headers:alpacaHdr()}),
+      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
+      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
     ]);
     const [d1,d2]=await Promise.all([r1.json(),r2.json()]);
     const tlt=(d1.bars||[]).slice(-1)[0]?.c;const shy=(d2.bars||[]).slice(-1)[0]?.c;
@@ -2255,7 +2230,7 @@ async function fetchMacroIndicators() {
   ind.sectores={};
   await Promise.all(Object.entries(secs).map(async([sym,label])=>{
     try{
-      const r=await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=sip&sort=asc`,{headers:alpacaHdr()});
+      const r=await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=iex&sort=asc`,{headers:alpacaHdr()});
       const d=await r.json();const bars=(d.bars||[]).map(b=>b.c);
       if(bars.length>=20){const last=bars[bars.length-1];
         ind.sectores[sym]={label,price:last.toFixed(2),mom_20d:((last-bars[0])/bars[0]*100).toFixed(1),mom_5d:((last-bars[bars.length-6])/bars[bars.length-6]*100).toFixed(1)};}
@@ -2307,37 +2282,6 @@ function scheduleMacro(){
   const ttl=prob>=70?MACRO_TTL.ALERTA:prob>=40?MACRO_TTL.VIGILANCIA:MACRO_TTL.BULL;
   setTimeout(async()=>{ await runMacroAnalysis(); scheduleMacro(); },ttl);
 }
-
-app.get('/regime/update', async (req, res) => {
-  try {
-    // Test directo de fetchDailyBars
-    const testUrl = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`;
-    const testR   = await fetch(testUrl, { headers: alpacaHdr() });
-    const testText = await testR.text();
-    let testData;
-    try { testData = JSON.parse(testText); } catch(e) { testData = { error: testText.slice(0,200) }; }
-
-    if (!testData.bars || testData.bars.length === 0) {
-      return res.json({
-        error: 'fetchDailyBars falló',
-        url:   testUrl,
-        status: testR.status,
-        response: testData,
-        alpaca_key: alpacaHdr()['APCA-API-KEY-ID'] ? 'configurada' : 'FALTA',
-      });
-    }
-
-    // Si llega aquí, fetchDailyBars funciona → forzar updateRegime
-    await updateRegime();
-    res.json({
-      ok:     true,
-      regime: MARKET_REGIME,
-      spy_bars_ok: testData.bars.length,
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message, stack: e.stack?.slice(0,300) });
-  }
-});
 
 app.get('/universe', (req, res) => {
   res.json({
