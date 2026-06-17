@@ -465,7 +465,7 @@ async function fetchBars15min(sym) {
 }
 async function fetchDailyBars(sym, limit = 220) {
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
     if (!text || text.trim().startsWith('<')) return null;
@@ -1778,7 +1778,7 @@ app.get('/alpaca/bars/daily', async (req, res) => {
   const { sym, limit = 504 } = req.query;
   if (!sym) return res.status(400).json({ error: 'sym required' });
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const d   = await r.json();
     if (!d.bars) return res.json({ sym, bars: [], count: 0 });
@@ -2163,7 +2163,7 @@ const MACRO_TTL = { BULL:7*24*3600000, VIGILANCIA:24*3600000, ALERTA:6*3600000 }
 async function fetchMacroIndicators() {
   const ind = {};
   try {
-    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=iex&sort=asc`,{headers:alpacaHdr()});
+    const r = await fetch(`${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=220&feed=sip&sort=asc`,{headers:alpacaHdr()});
     const d = await r.json();
     const bars=(d.bars||[]).map(b=>b.c);
     if(bars.length>=200){
@@ -2179,15 +2179,15 @@ async function fetchMacroIndicators() {
     }
   }catch(e){ind.spy_error=e.message;}
   try{
-    const r=await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=iex&sort=asc`,{headers:alpacaHdr()});
+    const r=await fetch(`${ALPACA_DATA}/v2/stocks/VIXY/bars?timeframe=1Day&limit=20&feed=sip&sort=asc`,{headers:alpacaHdr()});
     const d=await r.json();const bars=d.bars||[];
     if(bars.length>=5){const last=bars[bars.length-1].c;const prev=bars[bars.length-6]?.c||last;
       ind.vix={level:last.toFixed(2),chg_5d:((last-prev)/prev*100).toFixed(1),elevated:last>20,spike:((last-prev)/prev*100)>20};}
   }catch(e){}
   try{
     const [r1,r2]=await Promise.all([
-      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
-      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=iex&sort=asc`,{headers:alpacaHdr()}),
+      fetch(`${ALPACA_DATA}/v2/stocks/TLT/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`,{headers:alpacaHdr()}),
+      fetch(`${ALPACA_DATA}/v2/stocks/SHY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`,{headers:alpacaHdr()}),
     ]);
     const [d1,d2]=await Promise.all([r1.json(),r2.json()]);
     const tlt=(d1.bars||[]).slice(-1)[0]?.c;const shy=(d2.bars||[]).slice(-1)[0]?.c;
@@ -2197,7 +2197,7 @@ async function fetchMacroIndicators() {
   ind.sectores={};
   await Promise.all(Object.entries(secs).map(async([sym,label])=>{
     try{
-      const r=await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=iex&sort=asc`,{headers:alpacaHdr()});
+      const r=await fetch(`${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=25&feed=sip&sort=asc`,{headers:alpacaHdr()});
       const d=await r.json();const bars=(d.bars||[]).map(b=>b.c);
       if(bars.length>=20){const last=bars[bars.length-1];
         ind.sectores[sym]={label,price:last.toFixed(2),mom_20d:((last-bars[0])/bars[0]*100).toFixed(1),mom_5d:((last-bars[bars.length-6])/bars[bars.length-6]*100).toFixed(1)};}
