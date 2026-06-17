@@ -1,4 +1,4 @@
-// server.js — v3.6.0 (EXITS-ATR: trailing escalonado)
+// server.js — v3.7.0-FUSION (trailing ATR escalonado + locks + SIP)
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -1500,7 +1500,7 @@ async function pollTelegram() {
         const reg = MARKET_REGIME;
         const spyChg = await getSPYDailyChange();
         await sendTelegram(
-          `⚙️ <b>Estado V3.6.0</b>\n\n` +
+          `⚙️ <b>Estado V3.7.0</b>\n\n` +
           `🏛️ Régimen: <b>${reg.mode}</b>\n` +
           `SPY $${reg.price?.toFixed(2)||'—'} (${spyChg>=0?'+':''}${spyChg.toFixed(2)}% hoy)\n` +
           `SMA50 $${reg.sma50||'—'} | bearStreak: ${reg.bearStreak}\n\n` +
@@ -1532,7 +1532,7 @@ async function pollTelegram() {
       }
       else if (text === '/ayuda' || text === '/help') {
         await sendTelegram(
-          `🤖 <b>ORS V3.6.0</b>\n\n` +
+          `🤖 <b>ORS V3.7.0</b>\n\n` +
           `<b>ÓRDENES</b>\n` +
           `/si — Confirmar última orden\n` +
           `/no — Cancelar última orden\n` +
@@ -1564,7 +1564,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.6.0', version: '3.6.0',
+  status: 'ORS V3.7.0', version: '3.7.0',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1572,7 +1572,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.6.0',
+  status: 'ok', version: '3.7.0',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -2176,7 +2176,7 @@ Responde en español. Máximo 180 palabras. Sé directo y concreto.`;
 app.get('/debug/env', (req, res) => {
   const acc = getAcc();
   res.json({
-    version: '3.6.0',
+    version: '3.7.0',
     active_account: ACTIVE_ACCOUNT,
     key_defined:    !!acc.key,
     key_prefix:     (acc.key||'').slice(0,6),
@@ -2329,15 +2329,15 @@ app.post("/analisis-macro/scan",async(req,res)=>{
 
 
 app.listen(PORT, async () => {
-  console.log(`ORS V3.6.0 — puerto ${PORT}`);
+  console.log(`ORS V3.7.0-FUSION (trailing ATR + locks + SIP) — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring) + /analisis-ticker (CT+News+IA)`);
   await sendTelegram(
-    `🚀 <b>ORS V3.6.0 arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.7.0-FUSION arrancado</b>\n\n` +
     `BULL:    MOM (5) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
-    `<b>Nuevo v3.6.0:</b>\n` +
+    `<b>Nuevo v3.7.0:</b>\n` +
     `✅ /analisis-ticker — CT + Noticias + IA\n` +
     `✅ I10: Stop bajo VPOC\n` +
     `✅ D03: Bloquear si SPY<-1%\n` +
