@@ -254,6 +254,17 @@ let dynWatchlist  = [];
 // reinicios del proceso. Para persistencia total entre deploys, montar un
 // disco persistente o exportar el diario periódicamente.
 const STATE_FILE = process.env.STATE_FILE || './state.json';
+// v3.6.1 R4: purgar claves de monthlyTrades de meses anteriores (evita fuga)
+function purgeMonthlyTrades() {
+  const month = new Date().toISOString().slice(0,7);
+  let n = 0;
+  for (const k of Object.keys(monthlyTrades)) {
+    // claves del tipo SYM_YYYY-MM o SYM_short_YYYY-MM
+    const m = k.match(/_(\d{4}-\d{2})$/);
+    if (m && m[1] !== month) { delete monthlyTrades[k]; n++; }
+  }
+  if (n) console.log(`[CLEANUP] ${n} claves monthlyTrades de meses pasados purgadas`);
+}
 function saveState() {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify({
@@ -882,6 +893,21 @@ async function executeSell(sym, qty, reason, price) {
       return true;
     }
 
+    // v3.6.1 B2: usar la qty REAL del broker, no la del argumento (que pudo
+    // quedar obsoleta por fill parcial / intervención / reconcile). Evita
+    // sobre-vender un long (→ corto accidental) o cubrir de más un short.
+    let qtyReal = qty;
+    try {
+      const posData = await chk.json();
+      if (posData && posData.qty != null) {
+        qtyReal = Math.abs(parseInt(posData.qty));
+        if (qtyReal !== qty) {
+          console.log(`[SELL] ${sym} qty arg ${qty} ≠ broker ${qtyReal} → usando broker`);
+        }
+      }
+    } catch(_) { /* si falla, usar qty del argumento */ }
+    if (qtyReal < 1) { delete openPositions[sym]; saveState(); return true; }
+
     const openOrds = await fetch(`${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
       { headers:alpacaHdr() }).then(r => r.json()).catch(() => []);
     for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
@@ -892,7 +918,7 @@ async function executeSell(sym, qty, reason, price) {
     const side = isShortPos ? 'buy' : 'sell';
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method:'POST', headers:alpacaHdr(),
-      body: JSON.stringify({ symbol:sym, qty:String(qty), side,
+      body: JSON.stringify({ symbol:sym, qty:String(qtyReal), side,
         type:'market', time_in_force:'day' }),
     });
     const o = await r.json();
@@ -900,20 +926,22 @@ async function executeSell(sym, qty, reason, price) {
     // F3: usar fill real también en la salida
     const fill = await waitForFill(o.id, 10);
     const exitReal = (fill && fill.price) ? fill.price : price;
-    const pnl = pnlOf(exitReal);
+    const pnl = pos ? Math.round((isShortPos ? (pos.entry - exitReal) : (exitReal - pos.entry)) * qtyReal / EUR_USD) : 0;
     if (pos) {
       tradeHistory.unshift({
         sym, system: pos.system, entry: pos.entry, exit: exitReal,
-        qty, pnlEur: pnl, win: pnl > 0,
+        qty: qtyReal, pnlEur: pnl, win: pnl > 0,
         entryDate: pos.entryDate, exitDate: new Date().toISOString().slice(0,10),
         exitReason: reason,
       });
       if (tradeHistory.length > 500) tradeHistory = tradeHistory.slice(0, 500);
     }
     delete openPositions[sym];
+    // v3.6.1 R5: limpiar los hitos de alerta del símbolo (si reentra, vuelve a alertar)
+    for (const k of Object.keys(sentAlerts)) { if (k.startsWith(sym + '_hito_')) delete sentAlerts[k]; }
     saveState();
     await sendTelegram(
-      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qty} acc @ $${exitReal.toFixed(2)} (${side})\n` +
+      `🤖 <b>AUTO-EXIT — ${sym}</b>\n${qtyReal} acc @ $${exitReal.toFixed(2)} (${side})\n` +
       `Motivo: ${reason}\nP&L: ${pnl >= 0 ? '+' : ''}€${pnl}`
     );
     return true;
@@ -925,16 +953,9 @@ async function executeSell(sym, qty, reason, price) {
 // ═══════════════════════════════════════════════════════
 async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
   try {
-    const openOrds = await fetch(
-      `${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
-      { headers: alpacaHdr() }
-    ).then(r => r.json()).catch(() => []);
-    for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
-      if (ord.type === 'stop' || ord.type === 'stop_limit') {
-        await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
-          { method: 'DELETE', headers: alpacaHdr() }).catch(() => {});
-      }
-    }
+    // v3.6.1 R1: crear el nuevo stop ANTES de cancelar el viejo, para que la
+    // posición nunca quede sin protección entre ambas llamadas. Si el nuevo
+    // no se crea, se aborta y el viejo sigue vivo.
     const side = isShort ? 'buy' : 'sell';
     const r = await fetch(`${alpacaBase()}/v2/orders`, {
       method: 'POST', headers: alpacaHdr(),
@@ -945,15 +966,48 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
       }),
     });
     const o = await r.json();
-    if (o.id) {
-      console.log(`[STOP] ✅ ${sym} stop → $${newStop}`);
-      return true;
+    if (!o.id) {
+      console.log(`[STOP] ⚠️ ${sym}: no se pudo crear el nuevo stop — se conserva el viejo`);
+      return false;
     }
-    return false;
+    // El nuevo stop ya existe; ahora cancelar los stops antiguos (menos el nuevo)
+    const openOrds = await fetch(
+      `${alpacaBase()}/v2/orders?status=open&symbols=${sym}`,
+      { headers: alpacaHdr() }
+    ).then(r => r.json()).catch(() => []);
+    for (const ord of (Array.isArray(openOrds) ? openOrds : [])) {
+      if (ord.id !== o.id && (ord.type === 'stop' || ord.type === 'stop_limit')) {
+        await fetch(`${alpacaBase()}/v2/orders/${ord.id}`,
+          { method: 'DELETE', headers: alpacaHdr() }).catch(() => {});
+      }
+    }
+    console.log(`[STOP] ✅ ${sym} stop → $${newStop}`);
+    return true;
   } catch(e) {
     console.log(`[STOP] Error ${sym}:`, e.message);
     return false;
   }
+}
+
+// ═══════════════════════════════════════════════════════
+// v3.6.1 B1: LOCKS DE CONCURRENCIA
+// Cada tarea periódica se salta su ejecución si la anterior sigue corriendo
+// o si otra tarea que toca openPositions/tradeHistory está activa. Evita
+// que managePositions y reconcilePositions (timers independientes que cada
+// 15 min coinciden) se pisen y registren un trade dos veces o cierren una
+// posición que la otra ya borró.
+// ═══════════════════════════════════════════════════════
+const BUSY = { scan:false, manage:false, recon:false };
+async function withLock(name, fn) {
+  // 'manage' y 'recon' son mutuamente excluyentes (ambas mutan estado)
+  if (BUSY[name]) { console.log(`[LOCK] ${name} ya en ejecución — skip`); return; }
+  if ((name === 'manage' && BUSY.recon) || (name === 'recon' && BUSY.manage)) {
+    console.log(`[LOCK] ${name} pospuesto — la otra tarea de estado está activa`); return;
+  }
+  BUSY[name] = true;
+  try { return await fn(); }
+  catch(e) { console.log(`[LOCK ${name}]`, e.message); }
+  finally { BUSY[name] = false; }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1188,7 +1242,18 @@ async function managePositions() {
       const price = snap.price;
       const date  = new Date().toISOString().slice(0,10);
       const dailyBars = await fetchDailyBars(sym, 30);
-      const bar = { c: price, h: price * 1.001, l: price * 0.999 };
+      // v3.6.1 B3: high/low REALES de la última vela 15m (no inventados ±0.1%).
+      // La detección de stop interna comparaba contra un rango falso; ahora
+      // usa el rango real del minuto, que captura mechas que el snapshot puntual
+      // se perdía. (El stop GTC de Alpaca sigue siendo la red primaria.)
+      let bar = { c: price, h: price, l: price };
+      try {
+        const b15 = await fetchBars15min(sym);
+        if (b15 && b15.length) {
+          const lastBar = b15[b15.length - 1];
+          bar = { c: price, h: Math.max(lastBar.h || price, price), l: Math.min(lastBar.l || price, price) };
+        }
+      } catch(_) { /* fallback al precio puntual */ }
       let result = null;
       if (pos.system === 'SHORT') {
         result = await manageShortExit(sym, pos, bar, date, dailyBars);
@@ -1519,7 +1584,7 @@ async function pollTelegram() {
 // RUTAS API
 // ═══════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  status: 'ORS V3.6.0', version: '3.6.0',
+  status: 'ORS V3.6.1', version: '3.6.1',
   regime: MARKET_REGIME.mode,
   positions: Object.keys(openPositions).length,
   account: getAcc().label,
@@ -1527,7 +1592,7 @@ app.get('/', (req, res) => res.json({
   improvements: ['I10: Stop VPOC', 'D03: SPY>-1%', 'N02: Wyckoff Spring'],
 }));
 app.get('/health', (req, res) => res.json({
-  status: 'ok', version: '3.6.0',
+  status: 'ok', version: '3.6.1',
   regime: MARKET_REGIME,
   positions: Object.keys(openPositions),
   systems: {
@@ -2345,11 +2410,13 @@ app.listen(PORT, async () => {
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
-  setInterval(checkMOMSignals,   5*60*1000);
-  setInterval(checkShortSignals, 5*60*1000);
-  setInterval(managePositions,   3*60*1000);
-  setInterval(reconcilePositions, 5*60*1000); // F6
+  // v3.6.1 B1: timers envueltos en locks para evitar solapes
+  setInterval(() => withLock('scan',   checkMOMSignals),    5*60*1000);
+  setInterval(() => withLock('scan',   checkShortSignals),  5*60*1000);
+  setInterval(() => withLock('manage', managePositions),    3*60*1000);
+  setInterval(() => withLock('recon',  reconcilePositions), 5*60*1000); // F6
   setInterval(saveState,          5*60*1000); // F8
+  setInterval(purgeMonthlyTrades, 60*60*1000); // v3.6.1 R4
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
   setTimeout(()=>{ runMacroAnalysis().then(()=>scheduleMacro()); }, 20000);
@@ -2426,9 +2493,9 @@ app.listen(PORT, async () => {
       }
     } catch(e) { console.error('[BOOT] Error recuperando posiciones:', e.message); }
   }, 5000);
-  setTimeout(checkMOMSignals,    30*1000);
-  setTimeout(checkShortSignals,  35*1000);
-  setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
+  setTimeout(() => withLock('scan',  checkMOMSignals),     30*1000);
+  setTimeout(() => withLock('scan',  checkShortSignals),   35*1000);
+  setTimeout(() => withLock('recon', reconcilePositions),  20*1000);    // F6: primera pasada al arrancar
   function scheduleSector() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
