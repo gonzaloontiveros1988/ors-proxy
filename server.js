@@ -270,6 +270,19 @@ function loadState() {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     if (s.openPositions) Object.assign(openPositions, s.openPositions);
     if (Array.isArray(s.tradeHistory)) tradeHistory = s.tradeHistory;
+    // Cargar desde archivo si el estado está vacío
+    if (tradeHistory.length === 0) {
+      try {
+        const fs = require('fs');
+        if (fs.existsSync('/tmp/trade_history.json')) {
+          const saved = JSON.parse(fs.readFileSync('/tmp/trade_history.json','utf8'));
+          if (Array.isArray(saved) && saved.length > 0) {
+            tradeHistory = saved;
+            console.log(`[STATE] TradeHistory cargado desde archivo: ${tradeHistory.length} trades`);
+          }
+        }
+      } catch(e) {}
+    }
     if (s.monthlyTrades) Object.assign(monthlyTrades, s.monthlyTrades);
     console.log(`[STATE] Restaurado: ${Object.keys(openPositions).length} pos, ${tradeHistory.length} trades (guardado ${s.savedAt})`);
   } catch(e) { console.log('[STATE] load:', e.message); }
@@ -1541,26 +1554,52 @@ app.get('/health', (req, res) => res.json({
 app.get('/regime',        (req, res) => res.json(MARKET_REGIME));
 app.get('/market/regime', (req, res) => res.json(MARKET_REGIME));
 app.get('/positions', (req, res) => res.json(openPositions));
-app.get('/trades', (req, res) => {
+app.get('/trades', async (req, res) => {
   const limit = parseInt(req.query.limit) || 200;
+
+  // Obtener precios actuales de posiciones abiertas en un solo batch
+  const openSyms = Object.keys(openPositions);
+  let snapshots = {};
+  if (openSyms.length > 0) {
+    try {
+      const r = await fetch(
+        `${ALPACA_DATA}/v2/stocks/snapshots?symbols=${openSyms.join(',')}&feed=iex`,
+        { headers: alpacaHdr() }
+      );
+      snapshots = await r.json() || {};
+    } catch(e) {}
+  }
+
   // Incluir posiciones abiertas actuales como trades con status='open'
-  const openTrades = Object.entries(openPositions).map(([sym, pos]) => ({
-    id:           `OPEN_${sym}_${pos.edate}`,
+  const openTrades = Object.entries(openPositions).map(([sym, pos]) => {
+    const snap = snapshots[sym];
+    const currentPx = snap?.latestTrade?.p || snap?.dailyBar?.c || pos.entry;
+    const pnlUsd = pos.system === 'SHORT'
+      ? (pos.entry - currentPx) * pos.qty
+      : (currentPx - pos.entry) * pos.qty;
+    return {
+    id:           `OPEN_${sym}_${pos.entryDate}`,
     sym:          sym,
     ticker:       sym,
     system:       pos.system || 'MOM',
     module:       pos.system || 'MOM',
     status:       'open',
-    entry_date:   pos.edate,
+    entry_date:   pos.entryDate,
     entry_price:  pos.entry,
     stop:         pos.stop,
     qty:          pos.qty,
-    pnl_eur:      null,
+
     win:          null,
     reason:       null,
     be_active:    pos.be || false,
     runner:       pos.runner || false,
-  }));
+    max_price:    pos.maxPrice || pos.entry,
+    current_price: currentPx,
+    pnl_usd:      Math.round(pnlUsd * 100) / 100,
+    pnl_eur:      Math.round(pnlUsd / 1.08),
+    pnl_pct:      pos.entry > 0 ? Math.round((currentPx - pos.entry) / pos.entry * 1000) / 10 : 0,
+  };
+  });
   // Trades cerrados del historial
   const closedTrades = tradeHistory.slice(0, limit).map(t => ({
     ...t,
@@ -1578,6 +1617,25 @@ app.get('/trades', (req, res) => {
   // Devolver array directo (no objeto wrapeado)
   res.json([...openTrades, ...closedTrades]);
 });
+app.get('/trades/history', (req, res) => {
+  const limit = parseInt(req.query.limit) || 200;
+  const closed = tradeHistory.slice(0, limit).map(t => ({
+    ...t,
+    id:          t.id || `${t.sym}_${t.exitDate||t.date}`,
+    ticker:      t.sym,
+    module:      t.system || 'MOM',
+    status:      'closed',
+    entry_date:  t.entryDate || t.date,
+    exit_date:   t.exitDate,
+    entry_price: t.entry,
+    exit_price:  t.exit,
+    pnl_eur:     t.pnlEur || t.pnl || 0,
+    win:         t.win,
+    reason:      t.exitReason || t.reason || '',
+  }));
+  res.json(closed);
+});
+
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
     const wins  = trades.filter(t=>t.win);
