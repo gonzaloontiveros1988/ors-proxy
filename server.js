@@ -465,7 +465,7 @@ async function fetchBars15min(sym) {
 }
 async function fetchDailyBars(sym, limit = 220) {
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
     if (!text || text.trim().startsWith('<')) return null;
@@ -974,6 +974,18 @@ async function updateAlpacaStop(sym, qty, newStop, isShort = false) {
 // ═══════════════════════════════════════════════════════
 // SCANNER — MOM + BOLL (v3.4.0: D03 + I10 + N02)
 // ═══════════════════════════════════════════════════════
+const BUSY = { scan:false, manage:false, recon:false };
+async function withLock(name, fn) {
+  if (BUSY[name]) { console.log(`[LOCK] ${name} en ejecucion — skip`); return; }
+  if ((name === 'manage' && BUSY.recon) || (name === 'recon' && BUSY.manage)) {
+    console.log(`[LOCK] ${name} pospuesto`); return;
+  }
+  BUSY[name] = true;
+  try { return await fn(); }
+  catch(e) { console.log(`[LOCK ${name}]`, e.message); }
+  finally { BUSY[name] = false; }
+}
+
 async function checkMOMSignals() {
   if (!isEntryAllowed()) return;
 
@@ -1811,7 +1823,7 @@ app.get('/alpaca/bars/daily', async (req, res) => {
   const { sym, limit = 504 } = req.query;
   if (!sym) return res.status(400).json({ error: 'sym required' });
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=iex&sort=asc`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const d   = await r.json();
     if (!d.bars) return res.json({ sym, bars: [], count: 0 });
@@ -2378,10 +2390,10 @@ app.listen(PORT, async () => {
       }
     } catch(e) { console.log('[SYNC]', e.message); }
   }, 5000);
-  setInterval(checkMOMSignals,   5*60*1000);
-  setInterval(checkShortSignals, 5*60*1000);
-  setInterval(managePositions,   3*60*1000);
-  setInterval(reconcilePositions, 5*60*1000); // F6
+  setInterval(() => withLock('scan',   checkMOMSignals),    5*60*1000);
+  setInterval(() => withLock('scan',   checkShortSignals),  5*60*1000);
+  setInterval(() => withLock('manage', managePositions),    3*60*1000);
+  setInterval(() => withLock('recon',  reconcilePositions), 5*60*1000); // F6
   setInterval(saveState,          5*60*1000); // F8
   setInterval(pollTelegram,      3*1000);
   setInterval(updateRegime,      60*60*1000);
@@ -2459,9 +2471,9 @@ app.listen(PORT, async () => {
       }
     } catch(e) { console.error('[BOOT] Error recuperando posiciones:', e.message); }
   }, 5000);
-  setTimeout(checkMOMSignals,    30*1000);
-  setTimeout(checkShortSignals,  35*1000);
-  setTimeout(reconcilePositions, 20*1000);    // F6: primera pasada al arrancar
+  setTimeout(() => withLock('scan',  checkMOMSignals),     30*1000);
+  setTimeout(() => withLock('scan',  checkShortSignals),   35*1000);
+  setTimeout(() => withLock('recon', reconcilePositions),  20*1000);
   function scheduleSector() {
     const now    = new Date();
     const target = new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),20,15,0));
