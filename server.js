@@ -465,7 +465,9 @@ async function fetchBars15min(sym) {
 }
 async function fetchDailyBars(sym, limit = 220) {
   try {
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
+    // start = hace 2 años para forzar histórico completo independiente del horario
+    const startDate = new Date(Date.now() - 2*365*24*3600*1000).toISOString().slice(0,10);
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc&start=${startDate}`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
     if (!text || text.trim().startsWith('<')) return null;
@@ -1651,7 +1653,8 @@ app.post('/sector/run', async (req, res) => {
 app.get('/regime/update', async (req, res) => {
   try {
     // Test directo de fetchDailyBars con sip
-    const url = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`;
+    const startDate = new Date(Date.now() - 365*24*3600*1000).toISOString().slice(0,10);
+    const url = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc&start=${startDate}`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const d   = await r.json();
     if (!d.bars || d.bars.length === 0) {
