@@ -1,4 +1,4 @@
-// server.js — v3.7.0-FUSION (trailing ATR escalonado + locks + SIP)
+// server.js — v3.7.0 (EXITS-ATR: trailing escalonado + sync/history/load)
 // ORS Proxy — Sistema MOM V3
 // ===========================
 // BULL:    MOM V1 (5 slots) + Bollinger (1 slot)
@@ -1590,7 +1590,7 @@ app.get('/trades', (req, res) => {
   const limit = parseInt(req.query.limit) || 200;
   // Incluir posiciones abiertas actuales como trades con status='open'
   const openTrades = Object.entries(openPositions).map(([sym, pos]) => ({
-    id:           `OPEN_${sym}_${pos.edate}`,
+    id:           `OPEN_${sym}_${pos.entryDate}`,
     sym:          sym,
     ticker:       sym,
     system:       pos.system || 'MOM',
@@ -1647,6 +1647,66 @@ app.get('/sector/sentiment', (req, res) => res.json({
 app.post('/sector/run', async (req, res) => {
   res.json({ ok:true });
   updateSectorSentiment().catch(e => console.log('[SECTOR]', e.message));
+});
+app.get('/sync/history/load', async (req, res) => {
+  // GET alias — permite cargar historial desde el navegador sin necesitar POST.
+  // Lee órdenes cerradas de Alpaca y las importa al tradeHistory del servidor.
+  try {
+    const days = parseInt(req.query.days || '30');
+    const after = new Date(Date.now() - days*24*3600*1000).toISOString().slice(0,10);
+    const r = await fetch(
+      `${alpacaBase()}/v2/orders?status=closed&after=${after}&limit=200&direction=desc`,
+      { headers: alpacaHdr() }
+    );
+    const orders = await r.json();
+    if (!Array.isArray(orders)) return res.status(500).json({ error:'Error Alpaca', raw:orders });
+    const filled = orders.filter(o => o.status === 'filled');
+    const bySymbol = {};
+    for (const o of filled) {
+      const sym = o.symbol;
+      if (!bySymbol[sym]) bySymbol[sym] = [];
+      bySymbol[sym].push({ side:o.side, qty:parseFloat(o.filled_qty||o.qty),
+        price:parseFloat(o.filled_avg_price||0), time:o.filled_at||o.created_at, type:o.type });
+    }
+    const trades = [];
+    for (const [sym, ords] of Object.entries(bySymbol)) {
+      const buys   = ords.filter(o=>o.side==='buy').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      const sells  = ords.filter(o=>o.side==='sell').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      const shorts = ords.filter(o=>o.side==='sell_short').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      const covers = ords.filter(o=>o.side==='buy_to_cover').sort((a,b)=>new Date(a.time)-new Date(b.time));
+      for (let i=0; i<Math.min(buys.length,sells.length); i++) {
+        const buy=buys[i], sell=sells[i];
+        if (new Date(sell.time) > new Date(buy.time)) {
+          const pnlEur = Math.round((sell.price-buy.price)*buy.qty/EUR_USD);
+          const trade = { sym, system:'MOM', entry:buy.price, exit:sell.price, qty:buy.qty,
+            pnlEur, win:pnlEur>0, entryDate:buy.time.slice(0,10), exitDate:sell.time.slice(0,10),
+            exitReason:sell.type==='stop'?'StopBroker':'Exit', synced:true };
+          if (!tradeHistory.some(t=>t.sym===sym&&t.entryDate===trade.entryDate&&t.exitDate===trade.exitDate)) {
+            tradeHistory.unshift(trade); trades.push(trade);
+          }
+        }
+      }
+      for (let i=0; i<Math.min(shorts.length,covers.length); i++) {
+        const sh=shorts[i], cv=covers[i];
+        if (new Date(cv.time) > new Date(sh.time)) {
+          const pnlEur = Math.round((sh.price-cv.price)*sh.qty/EUR_USD);
+          const trade = { sym, system:'SHORT', entry:sh.price, exit:cv.price, qty:sh.qty,
+            pnlEur, win:pnlEur>0, entryDate:sh.time.slice(0,10), exitDate:cv.time.slice(0,10),
+            exitReason:'StopBroker', synced:true };
+          if (!tradeHistory.some(t=>t.sym===sym&&t.entryDate===trade.entryDate&&t.exitDate===trade.exitDate)) {
+            tradeHistory.unshift(trade); trades.push(trade);
+          }
+        }
+      }
+    }
+    tradeHistory.sort((a,b)=>new Date(b.exitDate)-new Date(a.exitDate));
+    if (tradeHistory.length>500) tradeHistory=tradeHistory.slice(0,500);
+    saveState();
+    const wins = trades.filter(t=>t.win);
+    const pnl  = trades.reduce((s,t)=>s+t.pnlEur,0);
+    res.json({ ok:true, recovered:trades.length, total:tradeHistory.length,
+      wr:trades.length?Math.round(wins.length/trades.length*100):0, pnl, trades });
+  } catch(e) { res.status(500).json({ error:e.message }); }
 });
 app.get('/sync', async (req, res) => {
   try {
@@ -2329,11 +2389,11 @@ app.post("/analisis-macro/scan",async(req,res)=>{
 
 
 app.listen(PORT, async () => {
-  console.log(`ORS V3.7.0-FUSION (trailing ATR + locks + SIP) — puerto ${PORT}`);
+  console.log(`ORS V3.7.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
   console.log(`Mejoras activas: I10(VPOC) + D03(SPY>-1%) + N02(Spring) + /analisis-ticker (CT+News+IA)`);
   await sendTelegram(
-    `🚀 <b>ORS V3.7.0-FUSION arrancado</b>\n\n` +
+    `🚀 <b>ORS V3.7.0 arrancado</b>\n\n` +
     `BULL:    MOM (5) + BOLL (1)\n` +
     `LATERAL: MOM 75% (5)\n` +
     `BEAR:    SHORT v3 (3)\n\n` +
