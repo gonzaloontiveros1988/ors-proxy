@@ -465,8 +465,7 @@ async function fetchBars15min(sym) {
 }
 async function fetchDailyBars(sym, limit = 220) {
   try {
-    const startDate = new Date(Date.now() - 2*365*24*3600*1000).toISOString().slice(0,10);
-    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc&start=${startDate}`;
+    const url = `${ALPACA_DATA}/v2/stocks/${sym}/bars?timeframe=1Day&limit=${limit}&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const text = await r.text();
     if (!text || text.trim().startsWith('<')) return null;
@@ -1624,6 +1623,25 @@ app.get('/trades', (req, res) => {
   // Devolver array directo (no objeto wrapeado)
   res.json([...openTrades, ...closedTrades]);
 });
+app.get('/trades/history', (req, res) => {
+  const limit = parseInt(req.query.limit) || 200;
+  const closed = tradeHistory.slice(0, limit).map(t => ({
+    ...t,
+    id:          t.id || `${t.sym}_${t.exitDate}`,
+    ticker:      t.sym,
+    module:      t.system || 'MOM',
+    status:      'closed',
+    entry_date:  t.entryDate,
+    exit_date:   t.exitDate,
+    entry_price: t.entry,
+    exit_price:  t.exit,
+    pnl_eur:     t.pnlEur || 0,
+    win:         t.win,
+    reason:      t.exitReason || '',
+  }));
+  res.json(closed);
+});
+
 app.get('/trades/stats/strategy', (req, res) => {
   function stats(trades) {
     const wins  = trades.filter(t=>t.win);
@@ -1642,34 +1660,31 @@ app.get('/trades/stats/strategy', (req, res) => {
     TOTAL: stats(tradeHistory),
   });
 });
-app.get('/sector/sentiment', (req, res) => {
-  const sentiment = sectorSentiment || {};
-  // Convertir a formato sectors[] que espera la app
-  const sectors = Object.entries(SECTOR_ETFS).map(([id, etf]) => ({
-    id, etf, name: SECTOR_NAMES[id] || id,
-    status: sentiment[id]?.status || 'NEUTRAL',
-    score:  sentiment[id]?.score  || 50,
-    reason: sentiment[id]?.reason || '',
-    emoji: {AI_CHIPS:'🤖',CLOUD:'☁️',SPACE:'🚀',CLEAN_ENERGY:'🌱',BIOTECH:'🧬',HEALTHCARE:'🏥',AIRLINES:'✈️',INDUSTRIAL:'🏭',FINTECH:'💳'}[id] || '📊',
-  }));
-  res.json({ lastUpdate: sectorLastUpdate, sentiment, sectors });
-});
+app.get('/sector/sentiment', (req, res) => res.json({
+  lastUpdate: sectorLastUpdate, sentiment: sectorSentiment,
+}));
 app.post('/sector/run', async (req, res) => {
   res.json({ ok:true });
   updateSectorSentiment().catch(e => console.log('[SECTOR]', e.message));
 });
 app.get('/regime/update', async (req, res) => {
   try {
-    const startDate = new Date(Date.now()-365*24*3600*1000).toISOString().slice(0,10);
-    const url = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc&start=${startDate}`;
+    // Test directo de fetchDailyBars con sip
+    const url = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`;
     const r   = await fetch(url, { headers: alpacaHdr() });
     const d   = await r.json();
-    if (!d.bars || d.bars.length === 0)
-      return res.json({ error:'fetchDailyBars falló', status:r.status, response:d,
-        key_ok: !!alpacaHdr()['APCA-API-KEY-ID'] });
+    if (!d.bars || d.bars.length === 0) {
+      return res.json({
+        error: 'fetchDailyBars falló',
+        status: r.status,
+        response: d,
+        key_ok: !!alpacaHdr()['APCA-API-KEY-ID'],
+        key_prefix: (alpacaHdr()['APCA-API-KEY-ID']||'').slice(0,6),
+      });
+    }
     await updateRegime();
-    res.json({ ok:true, regime:MARKET_REGIME, spy_bars:d.bars.length });
-  } catch(e) { res.status(500).json({ error:e.message }); }
+    res.json({ ok: true, regime: MARKET_REGIME, spy_bars: d.bars.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/sync/history/load', async (req, res) => {
@@ -2412,190 +2427,6 @@ app.post("/analisis-macro/scan",async(req,res)=>{
 });
 
 
-
-// ═══════════════════════════════════════════════════════
-// INFORME SECTORIAL COMPLETO — Macro + CT + Noticias + IA
-// ═══════════════════════════════════════════════════════
-const SECTOR_TICKERS = {
-  AI_CHIPS:     ['NVDA','AMD','AVGO','TSM','INTC'],
-  CLOUD:        ['MSFT','AMZN','GOOGL','ORCL','CRM'],
-  SPACE:        ['RKLB','LMT','NOC','BA','AXON'],
-  CLEAN_ENERGY: ['CEG','VST','NEE','GEV','ETR'],
-  BIOTECH:      ['LLY','VRTX','ABBV','AMGN','MRNA'],
-  HEALTHCARE:   ['UNH','HCA','ISRG','MCK','CI'],
-  AIRLINES:     ['DAL','UAL','AAL','LUV','RKLB'],
-  INDUSTRIAL:   ['CAT','HON','GE','RTX','GD'],
-  FINTECH:      ['JPM','GS','V','MA','COIN'],
-};
-
-const SECTOR_NAMES = {
-  AI_CHIPS:'AI & Semiconductores', CLOUD:'Cloud & Software',
-  SPACE:'Espacio & Defensa', CLEAN_ENERGY:'Energía Limpia',
-  BIOTECH:'Biotech & Farma', HEALTHCARE:'Salud',
-  AIRLINES:'Aerolíneas', INDUSTRIAL:'Industrial',
-  FINTECH:'Finanzas & Crypto',
-};
-
-// Cache de informes sectoriales
-let SECTOR_REPORTS = {};
-let SECTOR_REPORTS_TS = {};
-
-async function generarInformeSector(sectorId) {
-  const apiKey   = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  const etf      = SECTOR_ETFS[sectorId];
-  const tickers  = SECTOR_TICKERS[sectorId] || [];
-  const nombre   = SECTOR_NAMES[sectorId] || sectorId;
-
-  // 1. ETF performance
-  const bars = await fetchDailyBars(etf, 60).catch(()=>null);
-  let etfData = { perf5d:0, perf20d:0, perf60d:0, last:0, atr:0 };
-  if (bars && bars.length >= 20) {
-    const closes = bars.map(b=>b.c);
-    const last   = closes[closes.length-1];
-    const p5     = closes[closes.length-6];
-    const p20    = closes[closes.length-21];
-    const p60    = closes[0];
-    etfData = {
-      etf, last: last.toFixed(2),
-      perf5d:  ((last-p5)/p5*100).toFixed(1),
-      perf20d: ((last-p20)/p20*100).toFixed(1),
-      perf60d: ((last-p60)/p60*100).toFixed(1),
-      atr:     calcATR(bars.slice(-14).map((b,i,a)=>i>0?b:b), 14)?.toFixed(2) || '0',
-    };
-  }
-
-  // 2. Capitol Trades — top 3 tickers del sector
-  let ctSummary = { bullish:[], bearish:[], neutral:[], total_compras:0, total_ventas:0, politicos:[] };
-  const ctPromises = tickers.slice(0,3).map(sym => fetchCapitolTradesQuiver(sym).catch(()=>null));
-  const ctResults  = await Promise.all(ctPromises);
-  ctResults.forEach((ct, i) => {
-    if (!ct || ct.signal === 'NO_KEY' || ct.signal === 'NO_DATA') return;
-    const sym = tickers[i];
-    if (ct.signal === 'BULLISH' || ct.signal === 'BULLISH_WEAK') ctSummary.bullish.push(sym);
-    else if (ct.signal === 'BEARISH') ctSummary.bearish.push(sym);
-    else ctSummary.neutral.push(sym);
-    if (ct.trades && ct.trades.length) ctSummary.politicos.push(...ct.trades.slice(0,2));
-  });
-
-  // 3. Noticias sector — top ticker
-  const noticias = await fetchNoticiasAlpaca(tickers[0]).catch(()=>({headlines:[]}));
-
-  // 4. Análisis macro del sector (régimen actual)
-  const reg = MARKET_REGIME;
-
-  // 5. Claude — análisis exhaustivo
-  const ctText = ctSummary.bullish.length || ctSummary.bearish.length
-    ? `Señal CT: COMPRANDO ${ctSummary.bullish.join(',')||'ninguno'} | VENDIENDO ${ctSummary.bearish.join(',')||'ninguno'}\n` +
-      (ctSummary.politicos.length ? 'Detalles:\n' + ctSummary.politicos.slice(0,4).join('\n') : '')
-    : 'Capitol Trades: Sin actividad significativa en 90 días';
-
-  const newsText = noticias.headlines.slice(0,4).map(n=>`• [${n.date}] ${n.title}`).join('\n') || 'Sin noticias recientes';
-
-  const prompt = `Eres analista macro senior especializado en rotación sectorial y flujos institucionales.
-
-SECTOR: ${nombre} (ETF: ${etf})
-RÉGIMEN MERCADO: ${reg.mode} | SPY SMA50=${reg.sma50} SMA200=${reg.sma200}
-
-RENDIMIENTO ${etf}:
-  5 días:  ${etfData.perf5d}%
-  20 días: ${etfData.perf20d}%
-  60 días: ${etfData.perf60d}%
-  Precio:  $${etfData.last}
-
-TICKERS CLAVE: ${tickers.slice(0,5).join(', ')}
-
-CAPITOL TRADES (últimos 90 días):
-${ctText}
-
-NOTICIAS RECIENTES:
-${newsText}
-
-Genera un informe sectorial completo en español con EXACTAMENTE este formato JSON:
-{
-  "veredicto": "SOBREPONDERAR|NEUTRAL|INFRAPONDERAR",
-  "confianza": "ALTA|MEDIA|BAJA",
-  "resumen_ejecutivo": "2-3 frases sobre la situación actual del sector",
-  "situacion_macro": "Cómo afecta el entorno macro (tipos, Fed, dólar) a este sector",
-  "momentum_tecnico": "Análisis del rendimiento 5/20/60 días y lo que indica",
-  "flujo_politico": "Interpretación de las compras/ventas de congresistas — qué saben que nosotros no",
-  "catalizadores_positivos": ["máximo 3 catalizadores concretos para los próximos 30 días"],
-  "riesgos_principales": ["máximo 2 riesgos concretos"],
-  "tickers_preferidos": ["máximo 2 tickers del sector con mayor potencial"],
-  "tickers_evitar": ["máximo 1 ticker débil si existe"],
-  "plan_accion": "Qué hacer en el sistema MOM: BUSCAR_ENTRADAS|ESPERAR|EVITAR y por qué"
-}
-
-Sé específico y accionable. Máximo 400 palabras total.`;
-
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method:'POST',
-    headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
-    body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1200,
-      messages:[{role:'user',content:prompt}] }),
-  });
-  const data  = await r.json();
-  const text  = data.content?.[0]?.text || '{}';
-  let analisis = {};
-  try {
-    const j1=text.indexOf('{'), j2=text.lastIndexOf('}');
-    if(j1>=0&&j2>=0) analisis = JSON.parse(text.slice(j1,j2+1));
-  } catch(e) { analisis = { veredicto:'NEUTRAL', resumen_ejecutivo: text.slice(0,300) }; }
-
-  const result = {
-    sector_id:   sectorId,
-    sector_name: nombre,
-    etf,
-    etf_data:    etfData,
-    ct:          ctSummary,
-    noticias:    noticias.headlines.slice(0,4),
-    analisis,
-    generado_at: new Date().toISOString(),
-    regimen:     reg.mode,
-  };
-
-  SECTOR_REPORTS[sectorId]    = result;
-  SECTOR_REPORTS_TS[sectorId] = Date.now();
-  return result;
-}
-
-// GET /sector/informe/:id — informe completo de un sector
-app.get('/sector/informe/:id', async (req, res) => {
-  const id    = req.params.id.toUpperCase();
-  const force = req.query.force === 'true';
-  const TTL   = 6 * 3600 * 1000; // 6 horas
-
-  if (!SECTOR_ETFS[id]) return res.status(404).json({ error: 'Sector no encontrado' });
-
-  // Usar caché si es reciente
-  if (!force && SECTOR_REPORTS[id] && (Date.now()-SECTOR_REPORTS_TS[id]) < TTL) {
-    return res.json({ ...SECTOR_REPORTS[id], cached: true });
-  }
-
-  try {
-    const report = await generarInformeSector(id);
-    if (!report) return res.status(500).json({ error: 'Error generando informe' });
-    res.json(report);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /sector/resumen — todos los sectores con scores básicos (rápido)
-app.get('/sector/resumen', async (req, res) => {
-  const sentiment  = sectorSentiment || {};
-  const lastUpdate = sectorLastUpdate;
-  const sectores   = Object.entries(SECTOR_ETFS).map(([id, etf]) => ({
-    id, etf, name: SECTOR_NAMES[id] || id,
-    status: sentiment[id]?.status || 'NEUTRAL',
-    score:  sentiment[id]?.score  || 50,
-    reason: sentiment[id]?.reason || '',
-    has_report: !!SECTOR_REPORTS[id],
-    report_age_h: SECTOR_REPORTS_TS[id]
-      ? Math.round((Date.now()-SECTOR_REPORTS_TS[id])/3600000) : null,
-  }));
-  res.json({ sectores, lastUpdate, regimen: MARKET_REGIME.mode });
-});
-
-
 app.listen(PORT, async () => {
   console.log(`ORS V3.7.0 — puerto ${PORT}`);
   console.log(`Cuenta: ${getAcc().label} | AUTO: ${AUTO_EXECUTE}`);
@@ -2615,21 +2446,23 @@ app.listen(PORT, async () => {
     `Auto: ${AUTO_EXECUTE}`
   );
   setTimeout(async () => {
+    console.log('[BOOT] Iniciando updateRegime...');
     try {
-      const startDate = new Date(Date.now()-365*24*3600*1000).toISOString().slice(0,10);
+      // Test rápido de Alpaca antes de updateRegime
       const testR = await fetch(
-        `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=3&feed=sip&sort=asc&start=${startDate}`,
+        `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=3&feed=sip&sort=asc`,
         { headers: alpacaHdr() }
       );
       const testD = await testR.json();
-      console.log(`[BOOT] Alpaca SPY bars: ${testD.bars?.length||0} | status: ${testR.status}`);
+      console.log(`[BOOT] Alpaca test: status=${testR.status} bars=${testD.bars?.length||0}`);
       if (testD.bars && testD.bars.length > 0) {
         await updateRegime();
-        console.log(`[BOOT] Régimen: ${MARKET_REGIME.mode} SMA50=${MARKET_REGIME.sma50}`);
+        console.log(`[BOOT] Régimen OK: ${MARKET_REGIME.mode} SMA50=${MARKET_REGIME.sma50}`);
       } else {
-        console.log('[BOOT] Sin barras de Alpaca — régimen en espera');
+        console.log('[BOOT] Alpaca no devuelve barras — régimen pendiente');
+        console.log('[BOOT] Response:', JSON.stringify(testD).slice(0,200));
       }
-    } catch(e) { console.error('[BOOT] Error régimen:', e.message); }
+    } catch(e) { console.error('[BOOT] Error updateRegime:', e.message); }
   }, 3000);
   loadState(); // F8: restaurar estado antes del sync
   setTimeout(async () => {
