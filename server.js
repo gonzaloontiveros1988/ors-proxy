@@ -1088,7 +1088,7 @@ async function checkMOMSignals() {
     sentAlerts[key] = Date.now();
 
     if (AUTO_EXECUTE) {
-      await executeBuy(sym, entry, stop, qty, { system: sig.type, target, atr: atrVal });
+      await executeBuy(sym, entry, stop, qty, { system: sig.type, target, atr: atrVal, rsi: sig.rsi, rvol: sig.rvol, score: sig.score, rs: sig.rs });
       monthlyTrades[`${sym}_${month}`] = true;
       if (sig.type === 'MOM' && Object.values(openPositions).filter(p=>p.system==='MOM').length >= MAX_MOM) break;
       if (sig.type === 'BOLL' && Object.values(openPositions).filter(p=>p.system==='BOLL').length >= MAX_BOLL) break;
@@ -1624,22 +1624,91 @@ app.get('/trades', (req, res) => {
   res.json([...openTrades, ...closedTrades]);
 });
 app.get('/trades/history', (req, res) => {
-  const limit = parseInt(req.query.limit) || 200;
-  const closed = tradeHistory.slice(0, limit).map(t => ({
-    ...t,
-    id:          t.id || `${t.sym}_${t.exitDate}`,
-    ticker:      t.sym,
-    module:      t.system || 'MOM',
-    status:      'closed',
-    entry_date:  t.entryDate,
-    exit_date:   t.exitDate,
-    entry_price: t.entry,
-    exit_price:  t.exit,
-    pnl_eur:     t.pnlEur || 0,
-    win:         t.win,
-    reason:      t.exitReason || '',
-  }));
-  res.json(closed);
+  const limit  = parseInt(req.query.limit) || 200;
+  const EUR_USD_RATE = 1.08;
+  const SECTOR_MAP_LOCAL = {
+    NVDA:'AI/Chips',AMD:'AI/Chips',AVGO:'AI/Chips',TSM:'AI/Chips',MU:'AI/Chips',
+    INTC:'AI/Chips',LRCX:'Semi Equip',AMAT:'Semi Equip',
+    MSFT:'Cloud',AMZN:'Cloud',GOOGL:'Cloud',ORCL:'Cloud',META:'Software',
+    CRM:'Software',NOW:'Software',SNOW:'Software',DDOG:'Software',
+    UNH:'Salud',HCA:'Salud',ISRG:'Salud',LLY:'Biotech',VRTX:'Biotech',
+    ABBV:'Biotech',AMGN:'Biotech',MRNA:'Biotech',
+    CEG:'Energía',VST:'Energía',NEE:'Energía',ETR:'Energía',GEV:'Energía',
+    DAL:'Airlines',UAL:'Airlines',AAL:'Airlines',
+    CAT:'Industrial',HON:'Industrial',GD:'Defensa',RTX:'Defensa',LMT:'Defensa',
+    JPM:'Finanzas',GS:'Finanzas',MS:'Finanzas',
+    TSLA:'Auto/EV',RKLB:'Espacio',LUNR:'Espacio',
+    TKO:'Entretenimiento',BE:'Energía',COIN:'Crypto',
+  };
+
+  const closed = tradeHistory.slice(0, limit).map(t => {
+    const ret_pct   = t.entry > 0 ? ((t.exit - t.entry) / t.entry * 100) : 0;
+    const vol_usd   = t.entry * t.qty;
+    const dias      = t.entryDate && t.exitDate
+      ? Math.round((new Date(t.exitDate) - new Date(t.entryDate)) / 86400000)
+      : 0;
+    const riesgo_eur = t.initialStop
+      ? Math.abs(t.entry - t.initialStop) * t.qty / EUR_USD_RATE
+      : Math.abs(t.entry * 0.03) * t.qty / EUR_USD_RATE;
+    const r_multiple = riesgo_eur > 0 ? ((t.pnlEur || 0) / riesgo_eur) : 0;
+
+    return {
+      // Campos base
+      id:            t.id || `${t.sym}_${t.exitDate}`,
+      sym:           t.sym,
+      ticker:        t.sym,
+      system:        t.system || 'MOM',
+      module:        t.system || 'MOM',
+      status:        'closed',
+      // Fechas
+      entry_date:    t.entryDate,
+      exit_date:     t.exitDate,
+      dias_posicion: dias,
+      // Precios
+      entry_price:   t.entry,
+      exit_price:    t.exit,
+      stop_inicial:  t.initialStop || null,
+      // P&L
+      pnl_eur:       t.pnlEur || 0,
+      pnl_pct:       parseFloat(ret_pct.toFixed(2)),
+      win:           t.win,
+      // Sizing
+      qty:           t.qty,
+      volumen_usd:   parseFloat(vol_usd.toFixed(0)),
+      r_multiple:    parseFloat(r_multiple.toFixed(2)),
+      // Clasificación
+      sector:        SECTOR_MAP_LOCAL[t.sym] || 'Otros',
+      reason:        t.exitReason || t.reason || '',
+      // Indicadores de señal (si se guardaron)
+      rsi_entrada:   t.rsi || null,
+      rvol_entrada:  t.rvol || null,
+      score_entrada: t.score || null,
+      rs_entrada:    t.rs || null,
+      // Metadata
+      synced:        t.synced || false,
+    };
+  });
+
+  // Stats rápidas
+  const wins   = closed.filter(t => t.win);
+  const losses = closed.filter(t => !t.win);
+  const pnl    = closed.reduce((s,t) => s + t.pnl_eur, 0);
+  const gw     = wins.reduce((s,t) => s + t.pnl_eur, 0);
+  const gl     = Math.abs(losses.reduce((s,t) => s + t.pnl_eur, 0));
+
+  res.json({
+    trades:  closed,
+    stats: {
+      total:   closed.length,
+      wins:    wins.length,
+      losses:  losses.length,
+      wr:      closed.length ? Math.round(wins.length/closed.length*100) : 0,
+      pf:      gl > 0 ? parseFloat((gw/gl).toFixed(2)) : 0,
+      pnl_eur: Math.round(pnl),
+      avg_win:  wins.length  ? Math.round(gw/wins.length)    : 0,
+      avg_loss: losses.length ? Math.round(-gl/losses.length) : 0,
+    },
+  });
 });
 
 app.get('/trades/stats/strategy', (req, res) => {
