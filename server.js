@@ -1648,6 +1648,26 @@ app.post('/sector/run', async (req, res) => {
   res.json({ ok:true });
   updateSectorSentiment().catch(e => console.log('[SECTOR]', e.message));
 });
+app.get('/regime/update', async (req, res) => {
+  try {
+    // Test directo de fetchDailyBars con sip
+    const url = `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=5&feed=sip&sort=asc`;
+    const r   = await fetch(url, { headers: alpacaHdr() });
+    const d   = await r.json();
+    if (!d.bars || d.bars.length === 0) {
+      return res.json({
+        error: 'fetchDailyBars falló',
+        status: r.status,
+        response: d,
+        key_ok: !!alpacaHdr()['APCA-API-KEY-ID'],
+        key_prefix: (alpacaHdr()['APCA-API-KEY-ID']||'').slice(0,6),
+      });
+    }
+    await updateRegime();
+    res.json({ ok: true, regime: MARKET_REGIME, spy_bars: d.bars.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/sync/history/load', async (req, res) => {
   // GET alias — permite cargar historial desde el navegador sin necesitar POST.
   // Lee órdenes cerradas de Alpaca y las importa al tradeHistory del servidor.
@@ -2406,7 +2426,25 @@ app.listen(PORT, async () => {
     `Capital: €${CAPITAL_EUR.toLocaleString('es-ES')}\n` +
     `Auto: ${AUTO_EXECUTE}`
   );
-  setTimeout(updateRegime, 3000);
+  setTimeout(async () => {
+    console.log('[BOOT] Iniciando updateRegime...');
+    try {
+      // Test rápido de Alpaca antes de updateRegime
+      const testR = await fetch(
+        `${ALPACA_DATA}/v2/stocks/SPY/bars?timeframe=1Day&limit=3&feed=sip&sort=asc`,
+        { headers: alpacaHdr() }
+      );
+      const testD = await testR.json();
+      console.log(`[BOOT] Alpaca test: status=${testR.status} bars=${testD.bars?.length||0}`);
+      if (testD.bars && testD.bars.length > 0) {
+        await updateRegime();
+        console.log(`[BOOT] Régimen OK: ${MARKET_REGIME.mode} SMA50=${MARKET_REGIME.sma50}`);
+      } else {
+        console.log('[BOOT] Alpaca no devuelve barras — régimen pendiente');
+        console.log('[BOOT] Response:', JSON.stringify(testD).slice(0,200));
+      }
+    } catch(e) { console.error('[BOOT] Error updateRegime:', e.message); }
+  }, 3000);
   loadState(); // F8: restaurar estado antes del sync
   setTimeout(async () => {
     try {
