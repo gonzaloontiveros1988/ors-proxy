@@ -2860,6 +2860,13 @@ app.listen(PORT, async () => {
     }
     const ms = target - now;
     console.log(`[PROTO] próximo rebalanceo: ${target.toISOString()} (en ${Math.round(ms/3600000)}h)`);
+    // FIX: setTimeout desborda con esperas > ~24.8 días (límite int 32-bit) -> Node lo pone a 1ms = BUCLE.
+    // Si falta más que el máximo seguro, esperamos ese máximo y reprogramamos (encadenado).
+    const MAX_DELAY = 2147483647; // ~24.8 días en ms
+    if (ms > MAX_DELAY) {
+      setTimeout(scheduleMonthlyRebalance, MAX_DELAY);
+      return;
+    }
     setTimeout(async () => {
       await proposeMonthlyRebalance(false);
       scheduleMonthlyRebalance();   // reprogramar el mes siguiente
