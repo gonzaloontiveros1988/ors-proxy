@@ -248,6 +248,7 @@ let sectorLastUpdate = null;
 let HYSTERESIS    = { inPanic: false, calmDays: 0 };          // estado de pánico entre días
 let CURRENT_PHASE = { phase: 'NORMAL', detail: '', exposure12: 1.0, exposure6: 0.0, ts: 0 };
 let pendingRebalance = null;                                  // plan en ventana de veto
+let lastRebalance = null;                                     // último plan calculado (para la app)
 const PROTO_ENABLED = (process.env.PROTO_ENABLED || '1') === '1'; // activar protocolo v2
 const PROTO_UNIVERSE_MODE = process.env.PROTO_UNIVERSE || 'BASE'; // 'BASE' (curado) o 'FULL'
 // Cache SPY diario para D03
@@ -268,6 +269,7 @@ function buildStateObj() {
     monthlyTrades,
     HYSTERESIS,
     CURRENT_PHASE,
+    lastRebalance,
     savedAt: new Date().toISOString(),
   };
 }
@@ -278,6 +280,7 @@ function applyStateObj(s) {
   if (s.monthlyTrades) Object.assign(monthlyTrades, s.monthlyTrades);
   if (s.HYSTERESIS)    HYSTERESIS = s.HYSTERESIS;
   if (s.CURRENT_PHASE) CURRENT_PHASE = s.CURRENT_PHASE;
+  if (s.lastRebalance) lastRebalance = s.lastRebalance;
   console.log(`[STATE] Restaurado: ${Object.keys(openPositions).length} pos, ${tradeHistory.length} trades, fase ${CURRENT_PHASE.phase} (guardado ${s.savedAt})`);
 }
 let _saving = false;
@@ -683,6 +686,8 @@ async function proposeMonthlyRebalance(manual) {
     await sendTelegram(msg);
 
     pendingRebalance = { plan, ts: Date.now() };
+    lastRebalance = { plan, ts: Date.now(), executed: false };  // guardar para la app
+    saveState();
     setTimeout(async () => {
       if (!pendingRebalance) return;                       // cancelado por veto
       const p = pendingRebalance.plan; pendingRebalance = null;
@@ -735,6 +740,7 @@ async function executeRebalance(plan) {
     await new Promise(r => setTimeout(r, 400));
   }
   saveState();
+  if (lastRebalance) { lastRebalance.executed = true; lastRebalance.executedAt = Date.now(); saveState(); }
   await sendTelegram(`✅ <b>Rebalanceo completo</b> — cartera: ${momPositionSyms().join(', ') || '(cash)'}`);
 }
 
@@ -1829,6 +1835,43 @@ app.get('/phase', (req, res) => res.json({
   pendingRebalance: pendingRebalance ? { plan: pendingRebalance.plan, ts: pendingRebalance.ts } : null,
   protoEnabled: PROTO_ENABLED, universeMode: PROTO_UNIVERSE_MODE,
 }));
+// ── /proto/rebalance: info completa del rebalanceo mensual para la app ──
+app.get('/proto/rebalance', (req, res) => {
+  // calcular fecha del próximo rebalanceo (día 1 del mes que viene, saltando finde, 14:45 UTC)
+  const now = new Date();
+  let target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 14, 45, 0));
+  while (target.getUTCDay() === 0 || target.getUTCDay() === 6) target.setUTCDate(target.getUTCDate() + 1);
+  const lr = lastRebalance;
+  res.json({
+    phase: CURRENT_PHASE.phase,
+    phaseDetail: CURRENT_PHASE.detail,
+    exposure12: CURRENT_PHASE.exposure12,
+    exposure6: CURRENT_PHASE.exposure6,
+    nextRebalance: target.toISOString(),
+    pending: pendingRebalance ? { plan: pendingRebalance.plan, ts: pendingRebalance.ts } : null,
+    last: lr ? {
+      ts: lr.ts,
+      executed: lr.executed || false,
+      executedAt: lr.executedAt || null,
+      phase: lr.plan.phase,
+      detail: lr.plan.detail,
+      targetSyms: lr.plan.targetSyms || [],
+      targetWeights: lr.plan.targetWeights || {},
+      toSell: lr.plan.toSell || [],
+      toBuy: lr.plan.toBuy || [],
+      exposure12: lr.plan.exposure12,
+      exposure6: lr.plan.exposure6,
+    } : null,
+    currentPositions: momPositionSyms(),
+    protoEnabled: PROTO_ENABLED,
+  });
+});
+// ── /proto/run: dispara el rebalanceo manual desde la app (calcula y abre ventana de veto) ──
+app.post('/proto/run', async (req, res) => {
+  if (!PROTO_ENABLED) return res.status(400).json({ error: 'PROTO no habilitado' });
+  res.json({ ok: true, message: 'Rebalanceo lanzándose (1-2 min). Mira Telegram y luego /proto/rebalance.' });
+  proposeMonthlyRebalance(true).catch(e => console.log('[PROTO-RUN]', e.message));
+});
 app.get('/positions', (req, res) => res.json(openPositions));
 app.get('/trades', (req, res) => {
   const limit = parseInt(req.query.limit) || 200;
@@ -2817,13 +2860,6 @@ app.listen(PORT, async () => {
     }
     const ms = target - now;
     console.log(`[PROTO] próximo rebalanceo: ${target.toISOString()} (en ${Math.round(ms/3600000)}h)`);
-    // FIX: setTimeout desborda con esperas > ~24.8 días (límite int 32-bit).
-    // Si falta más que eso, esperamos el máximo seguro y reprogramamos (encadenado).
-    const MAX_DELAY = 2147483647; // ~24.8 días en ms
-    if (ms > MAX_DELAY) {
-      setTimeout(scheduleMonthlyRebalance, MAX_DELAY);
-      return;
-    }
     setTimeout(async () => {
       await proposeMonthlyRebalance(false);
       scheduleMonthlyRebalance();   // reprogramar el mes siguiente
